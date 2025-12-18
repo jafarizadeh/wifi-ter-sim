@@ -1,0 +1,6 @@
+part1 summary
+SSID=wifi-demo
+simTime=10
+distance=5
+AP_IP=10.1.0.1
+pcap=true
