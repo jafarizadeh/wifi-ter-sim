@@ -1,4 +1,3 @@
-```markdown
 # part 1 — Simulation Wi-Fi minimale (1 AP + 1 STA) avec Ping + PCAP (ns-3)
 
 Ce dépôt implémente le **part 1** : une simulation Wi-Fi minimale sous **ns-3** avec :
