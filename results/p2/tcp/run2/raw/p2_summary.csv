@@ -1,0 +1,2 @@
+transport,simTime,appStart,distance,pktSize,udpRate,tcpMaxBytes,seed,run,rxBytes,goodputbps
+tcp,20,2,5,1200,0,0,1,2,5084496,2.25978e+06

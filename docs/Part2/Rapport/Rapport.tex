@@ -1,0 +1,142 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=2.3cm}
+
+\sisetup{
+  detect-all,
+  round-mode          = places,
+  round-precision     = 3,
+  group-separator     = {\,},
+  per-mode            = symbol
+}
+
+\title{Projet 2 (ns-3) --- Analyse comparative UDP vs TCP\\Goodput et RTT sur une topologie Wi-Fi + CSMA}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\paragraph{Contexte et objectif.}
+L'objectif de ce travail est d'évaluer, sur une même topologie hybride \emph{Wi-Fi + CSMA}, les performances d'un trafic \emph{UDP} (débit offert imposé) et d'un trafic \emph{TCP} (contrôle de congestion), en se concentrant sur deux indicateurs opérationnels : le \emph{goodput} (débit utile réellement reçu par l'application) et la \emph{latence aller-retour} (\emph{RTT}) mesurée \emph{sous charge}. Au-delà d'une simple comparaison de moyennes, l'enjeu est de caractériser la dynamique temporelle (séries temporelles) et la variabilité (CDF/percentiles), afin d'expliquer les comportements observés.
+
+\paragraph{Topologie, paramétrage et déroulement expérimental.}
+La topologie comporte trois nœuds : \texttt{STA} (client), \texttt{AP} (point d'accès) et \texttt{Server}. Le lien \texttt{STA$\leftrightarrow$AP} est un lien Wi-Fi (802.11ax), et le lien \texttt{AP$\leftrightarrow$Server} est un lien CSMA. Deux sous-réseaux IPv4 sont utilisés : \texttt{10.1.0.0/24} côté Wi-Fi et \texttt{10.2.0.0/24} côté CSMA. Les tables de routage globales sont générées après l'affectation IP, ce qui garantit la connectivité \texttt{STA$\to$Server} à travers les deux segments. La mobilité est fixe : AP en \((0,0,0)\), STA en \((d,0,0)\) et Server en \((0,1,0)\), avec \(d=\SI{5}{m}\).
+La simulation dure \(\texttt{simTime}=\SI{20}{s}\) et le trafic principal démarre à \(\texttt{appStart}=\SI{2}{s}\), ce qui fixe la durée utile à
+\[
+T_{\mathrm{utile}} = \texttt{simTime} - \texttt{appStart} = \SI{18}{s}.
+\]
+Deux exécutions sont réalisées : (i) UDP, \(\texttt{udpRate}=\SI{50}{Mbps}\), \(\texttt{pktSize}=\SI{1200}{B}\) ; (ii) TCP, \(\texttt{tcpMaxBytes}=0\) (illimité), \(\texttt{pktSize}=\SI{1200}{B}\). Les graines RNG sont fixées (\texttt{seed/run}) afin de rendre les résultats reproductibles.
+
+\paragraph{Mesures : goodput et RTT sous charge.}
+Le \emph{goodput global} est calculé en fin de simulation à partir du nombre total d'octets reçus par le \texttt{PacketSink} :
+\[
+\mathrm{goodput}~(\si{bps}) = \frac{8 \cdot \texttt{rxBytes}}{T_{\mathrm{utile}}}.
+\]
+Cette définition est essentielle : moyenner sur \(\texttt{simTime}\) au lieu de \(T_{\mathrm{utile}}\) sous-estimerait artificiellement le débit utile (période sans trafic).
+En complément, une \emph{série temporelle} de goodput est obtenue par échantillonnage périodique de \texttt{GetTotalRx()} (pas \(\Delta t = \SI{0.5}{s}\)) ; le goodput instantané est estimé à partir de la variation \(\Delta \texttt{rxBytes}\) sur \(\Delta t\).
+Le RTT est mesuré pendant la période de trafic principal via une sonde à faible fréquence (\(\approx \SI{5}{Hz}\)). Lorsque l'outil \texttt{V4Ping} n'est pas disponible dans le build, une sonde \emph{echo} horodatée (timestamp + numéro de séquence) fournit une mesure équivalente : la sonde envoie un paquet léger, le serveur le renvoie, et le client calcule \(\mathrm{RTT} = t_{\mathrm{rx}} - t_{\mathrm{tx}}\). Les valeurs RTT sont exportées en CSV et peuvent être affichées dans la console.
+
+\paragraph{Résultats quantitatifs (synthèse).}
+Le Tableau~\ref{tab:summary} récapitule les métriques principales issues des sorties \texttt{console}, \texttt{stats} et \texttt{FlowMonitor} (UDP).
+On observe deux signatures nettes : (i) UDP atteint un débit utile \(\approx \SI{7}{Mbps}\) relativement stable, tandis que (ii) TCP converge vers un débit utile plus faible (\(\approx \SI{2.26}{Mbps}\)) et présente une latence beaucoup plus variable (queueing tail marqué).
+
+\begin{table}[h]
+\centering
+\caption{Synthèse des résultats (d=\SI{5}{m}, \texttt{simTime}=\SI{20}{s}, \texttt{appStart}=\SI{2}{s}).}
+\label{tab:summary}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Transport} & \textbf{Goodput global} & \textbf{Goodput moyen (TS)} & \textbf{RTT moyen} & \textbf{RTT p95 / p99} \\
+\midrule
+UDP (run1) & \SI{7.022}{Mbps} & \SI{7.023}{Mbps} & \SI{138.64}{ms} & \SI{143}{ms} / \SI{144}{ms} \\
+TCP (run2) & \SI{2.260}{Mbps} & \SI{2.259}{Mbps} & \SI{141.08}{ms} & \SI{198.8}{ms} / \SI{240.1}{ms} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Analyse UDP : débit stable mais saturation et pertes massives.}
+Les Figures~\ref{fig:udp_times} et \ref{fig:udp_cdf} montrent une stabilité remarquable du goodput instantané autour de \(\SI{7}{Mbps}\) ainsi qu'un RTT relativement concentré (CDF très abrupte).
+Cependant, l'analyse \texttt{FlowMonitor} révèle que cette stabilité n'implique pas un fonctionnement ``confortable'' du réseau. En effet, le débit offert UDP (\(\SI{50}{Mbps}\)) est largement supérieur à la capacité effectivement soutenable dans ce scénario, ce qui force une saturation : le flux principal (destination \(\texttt{port}=5000\)) subit une \emph{forte perte en paquets} (environ \(75\%\) des paquets transmis sont perdus). En parallèle, les paquets qui \emph{arrivent} peuvent accumuler un retard très important : le délai moyen (one-way) reporté par FlowMonitor est de l'ordre de plusieurs secondes sur le flux principal, alors que la sonde RTT (port \(\texttt{9000}\)) conserve une latence bien plus faible et stable.
+Ce contraste s'explique par deux mécanismes qui peuvent coexister : (i) l'existence d'une \emph{queueing tail} extrême sur une fraction des paquets du flux saturant (quelques paquets très retardés suffisent à faire exploser la moyenne), et (ii) la nature \emph{faible débit / petits paquets} de la sonde RTT, qui échantillonne le réseau sans contribuer significativement à l'encombrement et peut traverser les périodes de congestion avec une pénalisation plus limitée.
+D'un point de vue réseau, le résultat essentiel n'est donc pas seulement ``UDP a plus de débit'', mais ``UDP peut forcer le réseau en saturation'', au prix d'un compromis sévère : pertes élevées et délais très dégradés pour le trafic de données.
+
+\paragraph{Analyse TCP : débit inférieur mais variabilité de latence marquée.}
+Les Figures~\ref{fig:tcp_times} et \ref{fig:tcp_cdf} mettent en évidence une dynamique typiquement TCP. Le goodput converge vers \(\approx \SI{2.3}{Mbps}\) après une phase transitoire, et l'on observe des épisodes de baisse suivis de récupération. Dans le même temps, le RTT présente des \emph{pics} pouvant atteindre \(\approx \SI{240}{ms}\) et une CDF nettement plus étalée que pour UDP : alors que la médiane TCP reste proche de \(\SI{135}{ms}\), les percentiles élevés (p95 \(\approx\) \SI{199}{ms}, p99 \(\approx\) \SI{240}{ms}) révèlent un \emph{tail} de latence important.
+Ce comportement est cohérent avec le couplage entre le contrôle de congestion TCP (croissance/réduction de fenêtre, réactions à la perte ou au délai) et l'occupation des files : lors des périodes où la file se construit, la latence augmente ; après un événement de congestion (perte ou signal équivalent), la fenêtre se réduit, le débit chute temporairement et la file se draine, ce qui provoque une baisse rapide du RTT. La signature conjointe ``pic de RTT + perturbation du goodput'' est précisément ce qui distingue TCP d'un trafic UDP à débit imposé.
+
+\paragraph{Comparaison et interprétation globale.}
+Au niveau \emph{débit utile}, UDP domine dans ce scénario (\(\approx \SI{7}{Mbps}\) contre \(\approx \SI{2.26}{Mbps}\) pour TCP), mais cette domination est largement artificielle dans le sens où elle est obtenue en poussant un débit offert (\(\SI{50}{Mbps}\)) incompatible avec la capacité du lien : le système se stabilise sur un débit reçu plafonné, en sacrifiant de très nombreux paquets. TCP, à l'inverse, obtient un débit inférieur mais impose une régulation : il ne cherche pas à maintenir un débit offert constant, et sa performance est intimement liée à la dynamique de congestion (variations de fenêtre, occupation/désoccupation de file), ce qui se traduit par une latence plus variable et un tail plus lourd.
+Du point de vue QoS, la comparaison la plus informative est celle des distributions : UDP présente une latence RTT très concentrée pour la sonde (p99 \(\approx\) \SI{144}{ms}), tandis que TCP présente une dégradation marquée des percentiles (p99 \(\approx\) \SI{240}{ms}). Cela signifie qu'une application sensible aux \emph{pires cas} (gaming, VoIP, contrôle industriel) percevra davantage l'instabilité TCP dans ce scénario précis, même si la moyenne de RTT reste similaire.
+
+\paragraph{Exploitation des figures et recommandations de présentation.}
+Pour rendre l'analyse reproductible, les figures à inclure dans le dossier \texttt{docs/} sont :
+(i) goodput vs temps, (ii) RTT vs temps, (iii) RTT CDF, pour UDP et TCP.
+La présentation la plus efficace consiste à juxtaposer UDP et TCP sur des figures comparables, puis à commenter : stabilité du plateau de débit, apparition des pics de RTT, et lecture de la CDF (pente/étalement).
+Les fichiers \texttt{PCAP} permettent, si nécessaire, de confirmer la saturation (rafales, retransmissions MAC, pertes) via Wireshark.
+
+\paragraph{Limites et perspectives.}
+Deux limites doivent être explicitement mentionnées. Premièrement, si \texttt{V4Ping} n'est pas disponible dans le build, une sonde \emph{echo} horodatée constitue un substitut valide pour mesurer le RTT sous charge, mais il faut l'indiquer clairement pour éviter toute ambiguïté de conformité. Deuxièmement, une analyse encore plus complète consisterait à exporter systématiquement \texttt{FlowMonitor} et les CSV pour \emph{les deux} transports (UDP et TCP) afin de quantifier pertes et délais applicatifs de manière strictement comparable. Enfin, des campagnes paramétriques (variation de distance, débit offert, taille de paquet, MCS/PHY) permettraient de relier les observations à des seuils (transition non saturée \(\to\) saturée) et d'établir des courbes de performance.
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}{0.48\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/throughput_vs_time_udp_run1.png}
+  \caption{Goodput vs temps (UDP).}
+  \label{fig:udp_thr}
+\end{subfigure}\hfill
+\begin{subfigure}{0.48\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/rtt_vs_time_udp_run1.png}
+  \caption{RTT vs temps (UDP).}
+  \label{fig:udp_rtt}
+\end{subfigure}
+\caption{Séries temporelles UDP : plateau de goodput \(\approx \SI{7}{Mbps}\) et RTT relativement stable après le démarrage du trafic.}
+\label{fig:udp_times}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{figures/rtt_cdf_udp_run1.png}
+\caption{CDF du RTT (UDP). La distribution est très concentrée (faible dispersion), p99 \(\approx \SI{144}{ms}\).}
+\label{fig:udp_cdf}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}{0.48\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/throughput_vs_time_tcp_run2.png}
+  \caption{Goodput vs temps (TCP).}
+  \label{fig:tcp_thr}
+\end{subfigure}\hfill
+\begin{subfigure}{0.48\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{figures/rtt_vs_time_tcp_run2.png}
+  \caption{RTT vs temps (TCP).}
+  \label{fig:tcp_rtt}
+\end{subfigure}
+\caption{Séries temporelles TCP : goodput plus faible et épisodes de congestion visibles (pics de RTT et perturbations du débit).}
+\label{fig:tcp_times}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{figures/rtt_cdf_tcp_run2.png}
+\caption{CDF du RTT (TCP). La dispersion est plus forte que pour UDP : tail marqué (p95 \(\approx \SI{199}{ms}\), p99 \(\approx \SI{240}{ms}\)).}
+\label{fig:tcp_cdf}
+\end{figure}
+
+\end{document}

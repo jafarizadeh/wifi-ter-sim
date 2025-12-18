@@ -1,0 +1,4 @@
+
+# generated results
+results/**/*.pcap
+*.pcap
