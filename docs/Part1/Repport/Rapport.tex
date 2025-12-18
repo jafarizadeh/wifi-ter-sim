@@ -1,0 +1,144 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+\usepackage{hyperref}
+\usepackage{csquotes}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{siunitx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  rulecolor=\color{black},
+  showstringspaces=false
+}
+
+\title{part 1 --- Scénario minimal Wi-Fi sous ns-3\\(1 AP, 1 STA, Ping et traces PCAP)}
+\author{Jafarizadeh Mehdi}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Ce rapport documente la conception et la validation d’un scénario Wi-Fi minimal sous ns-3, conforme aux exigences du part~1 :
+une topologie composée d’un point d’accès (AP) et d’une station (STA), adressage IPv4, test de connectivité via \texttt{ping} (ICMP),
+génération de traces PCAP et organisation reproductible des sorties. L’objectif n’est pas de mesurer des performances,
+mais d’établir une base expérimentale robuste, paramétrable et vérifiable, réutilisable pour des scénarios plus avancés.
+\end{abstract}
+
+\section{Contexte et objectifs}
+Un scénario minimal bien validé est indispensable avant toute étude WLAN : il permet de vérifier, de bout en bout, la chaîne
+\emph{association Wi-Fi} $\rightarrow$ \emph{pile IP} $\rightarrow$ \emph{application}. Dans ns-3, un échec apparent (pas de réponses ICMP)
+peut provenir d’un mauvais SSID, d’un démarrage applicatif trop précoce, d’un adressage incohérent ou d’une sortie non collectée.
+Le part~1 impose ainsi un socle méthodologique : paramétrage en ligne de commande, production de preuves (ping et PCAP) et
+stockage standardisé des résultats pour assurer la reproductibilité.
+
+\section{Environnement expérimental}
+\subsection{Système et version de ns-3}
+Les expériences ont été réalisées avec :
+\begin{itemize}
+  \item OS : Ubuntu 24.04.3 LTS (\texttt{noble}).
+  \item ns-3 : \texttt{ns-3.46.1-128-g94b49bb34}.
+\end{itemize}
+Dans cette distribution ns-3, les arguments de l’exécutable doivent être passés après \texttt{--} dans la commande \texttt{./ns3 run},
+ce qui est intégré dans la procédure d’exécution.
+
+\section{Description du scénario}
+\subsection{Topologie et mobilité}
+Le scénario comprend exactement deux nœuds :
+\begin{itemize}
+  \item un AP en position fixe $(0,0,0)$,
+  \item une STA en position fixe $(d,0,0)$, où $d$ est paramétrable.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  node/.style={draw,rounded corners,minimum width=3.4cm,minimum height=1cm,align=center},
+  link/.style={-Latex,thick}
+]
+\node[node] (ap) {AP\\\texttt{ApWifiMac}};
+\node[node,right=4.3cm of ap] (sta) {STA\\\texttt{StaWifiMac}};
+\draw[link] (sta) -- node[above]{Wi-Fi (SSID)} (ap);
+\node[below=0.5cm of ap] {\small $(0,0,0)$};
+\node[below=0.5cm of sta] {\small $(d,0,0)$};
+\end{tikzpicture}
+\caption{Topologie minimale : un AP et une STA séparés par une distance $d$.}
+\end{figure}
+
+\subsection{Pile réseau et preuve de fonctionnement}
+Les deux nœuds reçoivent la pile Internet (IPv4). La preuve de fonctionnement retenue est double :
+(i) une séquence \texttt{ping} (ICMP Echo Request/Reply) de la STA vers l’AP, et
+(ii) des captures PCAP permettant une vérification externe via Wireshark/tshark.
+Le ping démarre à \SI{1}{\second} afin de laisser le temps à l’association Wi-Fi et à l’initialisation des interfaces.
+
+\section{Implémentation : décisions clés et justification}
+\subsection{Paramétrage et reproductibilité}
+Le scénario expose cinq paramètres (\texttt{ssid}, \texttt{simTime}, \texttt{distance}, \texttt{pcap}, \texttt{outDir}).
+Cette séparation \emph{code stable} / \emph{conditions expérimentales variables} est essentielle :
+elle permet de relancer le même scénario sans modification du code et prépare l’automatisation.
+
+\subsection{Traces PCAP : rôle et valeur}
+La capture PCAP n’est pas un « bonus » mais un outil de validation :
+elle permet d’observer les trames de gestion (association) et les paquets ICMP.
+Contrairement à une simple sortie console, le PCAP constitue une preuve audit-able et re-analysable.
+
+\section{Exécution et résultats}
+\subsection{Commande de lancement}
+Exemple de lancement (adapté à la syntaxe \texttt{./ns3} de cette version) :
+\begin{lstlisting}[language=bash]
+./ns3 run "scratch/p1_minimal_wifi -- \
+  --ssid=wifi-demo --distance=5 --simTime=10 \
+  --pcap=true --outDir=/chemin/vers/results/p1"
+\end{lstlisting}
+
+\subsection{Extrait de validation Ping (à insérer)}
+Coller ci-dessous un extrait représentatif (5 à 10 lignes) de la sortie ping :
+\begin{lstlisting}
+[COLLER ICI 5-10 LIGNES DE SORTIE PING]
+\end{lstlisting}
+
+\subsection{Traces PCAP produites}
+Les captures suivantes ont été générées :
+\begin{lstlisting}
+results/p1/raw/wifi_wifi-demo_d5m_ap-0-0.pcap
+results/p1/raw/wifi_wifi-demo_d5m_sta-1-0.pcap
+\end{lstlisting}
+
+\subsection{Analyse qualitative}
+Le succès du ping confirme simultanément :
+\begin{enumerate}
+  \item l’association entre STA et AP (sinon absence totale de trafic IP),
+  \item la cohérence de l’adressage IPv4 et l’activation des interfaces,
+  \item le passage effectif de trafic applicatif sur la liaison Wi-Fi.
+\end{enumerate}
+L’analyse PCAP complète cette validation en rendant visible la séquence de démarrage :
+trames de gestion, puis requêtes/réponses ICMP. Cette approche limite le risque de \enquote{faux positif}
+où l’on conclurait à un succès sans preuve exploitable.
+
+\section{Limites}
+Ce part~1 ne vise pas la performance (débit, latence sous charge, équité multi-utilisateurs).
+La topologie à deux nœuds et un flux ICMP sert avant tout à établir une base fiable et reproductible.
+Les métriques de performance seront pertinentes seulement après l’introduction de trafic de charge (UDP/TCP),
+de plusieurs stations, et de scénarios plus complexes.
+
+\section{Conclusion}
+Le scénario minimal AP/STA sous ns-3 est fonctionnel, paramétrable et reproductible.
+Les preuves de réussite incluent (i) les réponses ICMP et (ii) des captures PCAP correctement rangées.
+Cette base constitue un point de départ robuste pour les extensions ultérieures.
+
+\end{document}
