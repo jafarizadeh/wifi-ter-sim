@@ -1,0 +1,144 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{caption}
+
+\graphicspath{{./}}
+
+\title{Effect of distance and radio channel:
+RSSI/SNR and performance (goodput/RTT)}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+This report analyzes a PHY/MAC sweep for a Wi-Fi link in ns-3, focusing on how \emph{channel width}, \emph{transmission power}, and \emph{rate control strategy} shape two user-visible metrics: application goodput and RTT. The emphasis is placed on interpreting the measured data (not merely presenting it), explaining why the trends occur, and highlighting where the simulation exhibits threshold effects and queueing-driven latency regimes.
+
+\vspace{0.6em}
+\noindent
+The experiment considers a single AP--STA Wi-Fi link and runs a controlled matrix of conditions:
+two distances ($d\in\{5,20\}$ m), three channel widths ($B\in\{20,40,80\}$ MHz), two transmit powers ($P_\mathrm{tx}\in\{10,20\}$ dBm), and three rate-control configurations: an adaptive Minstrel-based mode and two fixed modes (MCS0 and MCS7). UDP offered load is set to a high value (e.g., \SI{600}{Mbps}) so that the network is frequently near saturation; this is crucial because it makes latency strongly dominated by queueing rather than propagation delay. The aggregated results used in the analysis are taken from the global CSV output (\texttt{p4\_matrix\_global.csv}), and the plots in Figures~\ref{fig:fig1}, \ref{fig:fig2}, and \ref{fig:fig3} summarize the same dataset.
+
+\section*{Measurement definitions and what they imply}
+Goodput is computed from the application sink bytes successfully received. If $R_\mathrm{x}$ is the received payload in bytes and $T_\mathrm{eff}$ is the effective measurement interval (simulation time minus warm-up), then
+\begin{equation}
+G \;=\; \frac{8\,R_\mathrm{x}}{T_\mathrm{eff}} \cdot 10^{-6}
+\qquad \text{[Mbps]}.
+\end{equation}
+Because this is \emph{application} goodput, it already reflects losses, retransmissions, contention overhead, and protocol headers. In a saturated regime, small changes in PHY robustness or MAC efficiency can move the system from ``stable service'' (queues bounded) to ``unstable service'' (queues grow), which will appear not only in goodput but also in RTT.
+
+\vspace{0.4em}
+\noindent
+RTT is measured using a light probe flow running concurrently with the main UDP traffic. In such an experiment, RTT should not be interpreted as mere propagation delay; it primarily indicates \emph{how long probe packets wait in queues and how often they suffer retransmissions}. That makes RTT a diagnostic for congestion and service-rate mismatch: when the offered load exceeds the sustainable service rate, the system develops persistent backlog and RTT inflates.
+
+\section*{Results and analysis}
+
+\subsection*{Channel width scaling under strong power (Tx=\SI{20}{dBm})}
+Figure~\ref{fig:fig1} shows goodput versus channel width at \SI{20}{dBm} for both distances. The strongest and most consistent effect in the entire dataset is that widening the channel from \SI{20}{MHz} to \SI{80}{MHz} yields a large goodput gain in every configuration that remains operational. This is expected because channel width increases the number of OFDM subcarriers and thus raises the PHY bit rate ceiling; however, the goodput gain is \emph{not perfectly linear} because MAC overheads (ACKs, contention, interframe spacing), fixed headers, and rate-control dynamics consume airtime that does not scale with bandwidth.
+
+\vspace{0.4em}
+\noindent
+At $d=\SI{5}{m}$, Adaptive (Minstrel) achieves approximately \SI{108.6}{Mbps} at \SI{20}{MHz}, \SI{206.0}{Mbps} at \SI{40}{MHz}, and \SI{344.5}{Mbps} at \SI{80}{MHz}. The \SI{20}{MHz}$\to$\SI{80}{MHz} scaling factor is about $3.17\times$, which is clearly below the ideal $4\times$ scaling and is therefore consistent with the presence of substantial airtime overhead and contention. Fixed MCS7 scales from about \SI{65.9}{Mbps} to \SI{255.8}{Mbps} across the same bandwidth range, a factor near $3.88\times$, which is closer to ideal scaling; this makes sense because once a high spectral-efficiency mode is stable, more of the airtime becomes payload-dominated and less is spent in retries.
+
+\vspace{0.4em}
+\noindent
+At $d=\SI{20}{m}$, Adaptive still benefits from bandwidth but scales more weakly: about \SI{85.6}{Mbps} (\SI{20}{MHz}) to \SI{236.1}{Mbps} (\SI{80}{MHz}), a factor near $2.76\times$. This reveals that at larger distance the system is more often constrained by link margin (lower SNR, more retries, or more conservative rate selection), so the extra bandwidth cannot be fully converted into delivered payload. A notable (and realistic) outcome is that at $d=\SI{20}{m}$ and $B=\SI{80}{MHz}$, Fixed MCS7 slightly \emph{outperforms} Adaptive (about \SI{255.7}{Mbps} versus \SI{236.1}{Mbps}). In practical terms, this suggests that the adaptive controller is somewhat conservative under these edge conditions. Such conservatism is common: rate adaptation trades peak throughput for robustness across time-varying conditions, and under heavy offered load even modest extra retransmissions can measurably reduce application goodput.
+
+\vspace{0.6em}
+\noindent
+Table~\ref{tab:tx20_goodput} provides the numerical values from the sweep at \SI{20}{dBm}. The main interpretive message is not merely ``wider is faster,'' but that \emph{the efficiency of converting bandwidth into goodput depends strongly on whether the system operates in a stable high-rate regime (bounded retries and bounded queues) or in a marginal regime where the controller retreats to safer rates and spends airtime on recovery.}
+
+\begin{table}[H]
+\centering
+\caption{Goodput (Mbps) versus channel width at Tx=\SI{20}{dBm}. Values are directly from the sweep results.}
+\label{tab:tx20_goodput}
+\sisetup{round-mode=places,round-precision=1}
+\begin{tabular}{@{}c c S[table-format=3.1] S[table-format=3.1] S[table-format=3.1]@{}}
+\toprule
+Distance (m) & BW (MHz) & {Adaptive} & {Fixed MCS0} & {Fixed MCS7} \\
+\midrule
+5  & 20 & 108.6 & 6.4  & 65.9  \\
+5  & 40 & 206.0 & 13.0 & 129.6 \\
+5  & 80 & 344.5 & 27.3 & 255.8 \\
+\addlinespace
+20 & 20 & 85.6  & 6.4  & 65.9  \\
+20 & 40 & 155.1 & 13.0 & 129.6 \\
+20 & 80 & 236.1 & 27.3 & 255.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{fig1_bandwidth_scaling.png}
+\caption{Impact of channel width on application goodput at Tx=\SI{20}{dBm}, for $d=\SI{5}{m}$ and $d=\SI{20}{m}$.}
+\label{fig:fig1}
+\end{figure}
+
+\subsection*{Power sensitivity at the cell edge (d=\SI{20}{m}, BW=\SI{80}{MHz})}
+Figure~\ref{fig:fig2} isolates the edge link ($d=\SI{20}{m}$) at a wide channel ($B=\SI{80}{MHz}$) and compares \SI{10}{dBm} and \SI{20}{dBm}. The outcome demonstrates a classical wireless ``cliff'' effect: high-rate configurations can transition from near-zero delivered throughput to very high throughput with a modest increase in transmit power because the underlying packet error probability changes sharply around an SNR threshold.
+
+\vspace{0.4em}
+\noindent
+For Fixed MCS7, the dataset shows a complete collapse at \SI{10}{dBm} (goodput \SI{0}{Mbps}) and a strong recovery at \SI{20}{dBm} (goodput about \SI{255.7}{Mbps}). This is exactly the signature of operating below the decoding threshold at low power: packets fail frequently, the retry mechanism is overwhelmed, and almost no payload is delivered. Increasing power by \SI{10}{dB} substantially improves link margin, pushing the system into a region where MCS7 becomes feasible and stable.
+
+\vspace{0.4em}
+\noindent
+Adaptive improves from roughly \SI{88.9}{Mbps} at \SI{10}{dBm} to \SI{236.1}{Mbps} at \SI{20}{dBm} (a $2.66\times$ improvement). Unlike Fixed MCS7, it does not collapse because it can fall back to more robust rates and maintain some level of delivery. That behavior is exactly what adaptation is for: it provides graceful degradation when conditions worsen. Fixed MCS0, by contrast, remains around \SI{27.3}{Mbps} at both power levels; the bottleneck here is not reliability but spectral efficiency, so more power does not create a proportional gain.
+
+\vspace{0.4em}
+\noindent
+This figure also explains the broader interaction between bandwidth and power. At wide bandwidth, the receiver integrates noise over a larger spectrum, so the effective SNR can be lower than in a narrow channel for the same transmit power. Therefore, in edge conditions a wide channel can be \emph{highly beneficial when margin is sufficient} (large goodput) but \emph{catastrophic when margin is insufficient} (collapse of high MCS). The data captures this engineering trade-off clearly and is one of the strongest, most realistic insights of the sweep.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\linewidth]{fig2_power_sensitivity.png}
+\caption{Power sensitivity at the cell edge for $d=\SI{20}{m}$, $B=\SI{80}{MHz}$. High MCS exhibits a sharp feasibility threshold.}
+\label{fig:fig2}
+\end{figure}
+
+\subsection*{Latency behavior and why RTT is dominated by queueing}
+Figure~\ref{fig:fig3} reports mean RTT at $d=\SI{20}{m}$ as a function of bandwidth for the three configurations. The RTT values are large (tens to hundreds of milliseconds, in some cases approaching \SI{500}{ms}). This is not an anomaly; it is a direct consequence of operating the link under a high offered load. When traffic demand is comparable to or higher than sustainable service rate, queues fill and delay becomes dominated by queueing time. In such a regime, RTT serves as a proxy for how well the system ``keeps up'' with the offered load.
+
+\vspace{0.4em}
+\noindent
+The Fixed MCS0 curve exhibits the most textbook queueing signature. At \SI{20}{MHz}, goodput is only about \SI{6.4}{Mbps} (Table~\ref{tab:tx20_goodput}), while the offered load is orders of magnitude higher. The transmitter therefore remains backlogged almost constantly, and probes experience extremely long waiting times, yielding RTT near \SI{500}{ms}. As bandwidth increases to \SI{40}{MHz} and \SI{80}{MHz}, goodput rises to around \SI{13}{Mbps} and \SI{27}{Mbps}. While these are still far below the offered load, the service rate improvement reduces average queue occupancy and thus lowers RTT. Importantly, this is not ``propagation getting faster''; it is the \emph{queueing component} shrinking because the system can drain packets more quickly.
+
+\vspace{0.4em}
+\noindent
+Adaptive shows a different but consistent story: RTT decreases with bandwidth (approximately from the \SI{100}{ms} range toward the \SI{60}{ms} range). This follows the same queueing logic. Adaptive achieves substantially higher service rates than MCS0, hence queues are less persistently saturated and RTT is lower. The fact that RTT improvement from \SI{40}{MHz} to \SI{80}{MHz} is smaller than from \SI{20}{MHz} to \SI{40}{MHz} indicates diminishing returns: once service rate is high enough to carry a significant fraction of the offered load, incremental capacity produces smaller reductions in backlog.
+
+\vspace{0.4em}
+\noindent
+Fixed MCS7 presents the most nuanced latency behavior. When the link is stable (notably at \SI{20}{dBm}), MCS7 provides high goodput and therefore very low RTT (tens of milliseconds). However, at \SI{10}{dBm} and wide bandwidths the link becomes infeasible (goodput drops to zero for \SI{40}{MHz} and \SI{80}{MHz}). In those infeasible cases, RTT samples may be missing (no valid probe receptions), which must be interpreted as a \emph{link-down regime} rather than a large-delay regime. This distinction matters in a rigorous analysis: extremely large RTT indicates congestion with delivery still occurring, while missing RTT indicates failure to deliver at all. The dataset includes such failures for MCS7 at \SI{10}{dBm} with \SI{40}{MHz} and \SI{80}{MHz}, which is consistent with the ``cliff'' observed in Figure~\ref{fig:fig2}.
+
+\vspace{0.4em}
+\noindent
+Across all edge cases with valid RTT samples, the relationship between throughput and RTT is strongly negative (higher goodput generally implies lower RTT), consistent with a queueing-dominated regime. In fact, the measurements show a pronounced coupling: as soon as the configuration moves away from saturation (by increasing bandwidth, increasing power, or selecting a more efficient mode), RTT drops substantially.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\linewidth]{fig3_latency_analysis.png}
+\caption{Mean RTT versus channel width at $d=\SI{20}{m}$. Under heavy offered load, latency is dominated by queueing and closely tracks service capacity.}
+\label{fig:fig3}
+\end{figure}
+
+\section*{Discussion: what the dataset teaches beyond ``bigger is better''}
+The sweep demonstrates three qualitatively different regimes that are essential for understanding Wi-Fi performance under load. In the first regime (strong link, e.g., \SI{5}{m} and \SI{20}{dBm}), wider channels almost directly translate into higher delivered throughput, and adaptive control can outperform a fixed high MCS because it opportunistically uses aggressive modes while keeping loss manageable. In the second regime (marginal link at the edge), the system becomes sensitive to configuration details: Adaptive may underperform an optimally chosen fixed mode because it is conservative or because its mode set does not perfectly match the PHY configuration, yet it remains far more robust when the margin decreases. In the third regime (below threshold), the link can collapse entirely for high MCS, producing zero throughput and effectively undefined RTT, which should be reported as \emph{infeasible operating points} rather than as ``high delay.''
+
+\vspace{0.4em}
+\noindent
+Equally important, the latency results show that in high-load experiments, RTT should be interpreted primarily through the lens of queueing theory. When offered load exceeds sustainable capacity, queues grow and RTT inflates regardless of the raw propagation conditions. Therefore, the observed RTT improvements with larger bandwidth are best explained as reductions in backlog due to higher service rate, not as intrinsic PHY delay reductions. This interpretation is consistent across configurations and is supported by the co-movement of goodput and RTT in the data.
+
+\section*{Conclusion}
+The results provide a coherent, data-driven narrative about PHY/MAC trade-offs. Channel width is a dominant lever for throughput, but its realized gain depends on whether the system remains in a stable, high-efficiency regime. Transmit power strongly affects feasibility at the edge, producing threshold behavior where high MCS can transition from failure to excellent performance. Finally, under heavy offered load, RTT becomes a queueing metric tightly coupled to delivered capacity; improving the service rate via bandwidth, power, or mode selection reduces backlog and thus reduces RTT. These insights are not merely qualitative expectations; they are directly evidenced by the measured sweep and the strong alignment between throughput and latency trends across the explored parameter space.
+
+\end{document}
