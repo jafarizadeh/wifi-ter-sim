@@ -1,30 +1,27 @@
-\documentclass[a4paper,11pt]{article}
+\documentclass[a4paper,12pt]{article}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{graphicx}
 \usepackage{geometry}
 \usepackage{hyperref}
-\usepackage{listings}
-\usepackage{xcolor}
-\usepackage{float}
+\usepackage{amsmath, amssymb, amsfonts}
 \usepackage{booktabs}
 \usepackage{subcaption}
-\usepackage{amsmath}
+\usepackage{cite}
+\usepackage{float}
+\usepackage{fancyhdr}
 
+% Page layout configuration
 \geometry{top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm}
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\small Analysis of Wi-Fi 6 Performance}
+\lhead{\small Network Simulation}
+\cfoot{\thepage}
 
-% Setup for code listings
-\lstset{
-    basicstyle=\ttfamily\small,
-    breaklines=true,
-    frame=single,
-    keywordstyle=\color{blue},
-    commentstyle=\color{green!60!black},
-    stringstyle=\color{red}
-}
-
-\title{\textbf{Part 3: Advanced Analysis of Wi-Fi 6 Performance}\\
-\large Impact of Distance and Realistic Propagation Models}
+\title{\textbf{\Large Advanced Performance Analysis of IEEE 802.11ax (Wi-Fi 6)}\\[0.5cm] \large 
+Effect of distance and radio channel:\\
+RSSI/SNR (bonus) and performance (goodput/RTT)}
 \author{JAFARIZADEH Mehdi}
 \date{\today}
 
@@ -33,128 +30,142 @@
 \maketitle
 
 \begin{abstract}
-This report presents a detailed analysis of the performance of an IEEE 802.11ax (Wi-Fi 6) network under realistic channel conditions. Unlike basic simulations that assume a deterministic environment, this study incorporates stochastic elements including Log-Distance path loss, Log-Normal Shadowing, and Nakagami Fading. By performing an automated sweep of distances ranging from 1 to 30 meters, we evaluate the impact of signal degradation on Goodput and Round Trip Time (RTT) for both UDP and TCP protocols. The results highlight the "Cell Edge" phenomenon and demonstrate the distinct flow-control behaviors of transport layer protocols in lossy wireless environments.
+\noindent This study provides a rigorous analysis of the performance characteristics of an IEEE 802.11ax (Wi-Fi 6) network under realistic indoor propagation conditions. Utilizing the \textit{ns-3} discrete-event network simulator, we modeled a stochastic channel incorporating Log-Distance path loss ($\gamma=3.0$), Log-Normal Shadowing ($\sigma=5.0$ dB), and Nakagami-$m$ fading. The research systematically evaluates the impact of signal-to-noise ratio (SNR) degradation on Application Layer Throughput (Goodput) and Round Trip Time (RTT) across a distance sweep of 1 to 30 meters. A key finding of this research is the divergent latency behavior of UDP and TCP at the cell edge: while UDP induces bufferbloat leading to increased latency, TCP's congestion control mechanism effectively mitigates queuing delay, paradoxically reducing RTT in lossy conditions.
 \end{abstract}
 
 \tableofcontents
 \newpage
 
-\section{Introduction and Objectives}
-Wireless networks in real-world environments are subject to various impairments such as signal attenuation over distance, obstruction by objects (shadowing), and multipath propagation (fading). The objective of this part is to simulate these phenomena using \textbf{ns-3} to create a "digital twin" of a realistic indoor Wi-Fi scenario.
+\section{1. Introduction}
+The IEEE 802.11ax standard, marketed as Wi-Fi 6, introduces significant improvements in spectral efficiency through technologies like OFDMA and 1024-QAM. However, the theoretical limits of these technologies are heavily constrained by physical layer (PHY) impairments in real-world environments. Accurate network planning requires understanding how large-scale fading (path loss, shadowing) and small-scale fading (multipath) affect upper-layer protocols.
 
-Specific goals include:
+This part aims to bridge the gap between ideal theoretical models and realistic performance by simulating a "digital twin" of a cluttered indoor environment. We specifically analyze the non-linear relationship between distance and Quality of Service (QoS) metrics for both connection-oriented (TCP) and connectionless (UDP) protocols.
+
+\section{2. Theoretical Framework and Mathematical Models}
+To ensure high fidelity in simulation, deterministic models were replaced with stochastic processes representing physical wave propagation.
+
+\subsection{2.1 Large-Scale Fading: Path Loss and Shadowing}
+The received power $P_r(d)$ at distance $d$ is modeled using the Log-Distance Path Loss model combined with Log-Normal Shadowing. The path loss $L(d)$ in decibels (dB) is expressed as:
+
+\begin{equation}
+    L(d) = L(d_0) + 10 \gamma \log_{10}\left(\frac{d}{d_0}\right) + X_\sigma
+\end{equation}
+
+Where:
 \begin{itemize}
-    \item Moving beyond the ideal "Friis" model to a more complex \textbf{LogDistance + Shadowing + Fading} model.
-    \item Quantifying the "Goodput Cliff" — the distance at which the link becomes unusable.
-    \item Analyzing the latency (RTT) dynamics: specifically, why TCP and UDP latencies diverge at the cell edge.
-    \item Assessing the stability of the connection using time-series analysis.
+    \item $L(d_0)$: Reference path loss at distance $d_0 = 1$ m (calculated as 46.67 dB for 5 GHz).
+    \item $\gamma$: Path Loss Exponent. We selected $\gamma = 3.0$ to model a shadowed indoor environment (heavier attenuation than free space $\gamma=2.0$).
+    \item $X_\sigma$: A zero-mean Gaussian random variable $X_\sigma \sim \mathcal{N}(0, \sigma^2)$ representing Shadowing, with $\sigma = 5.0$ dB.
 \end{itemize}
 
-\section{Simulation Methodology}
+This stochastic term $X_\sigma$ accounts for the variation in received power due to obstacles (walls, furniture), making the channel non-deterministic.
 
-\subsection{Topology and Network Stack}
-The simulation setup involves a linear topology consisting of three nodes:
-\begin{itemize}
-    \item \textbf{Station (STA):} A mobile Wi-Fi 6 client located at coordinates $(d, 0, 0)$, where $d$ varies from 1m to 30m.
-    \item \textbf{Access Point (AP):} Located at $(0, 0, 0)$, bridging the wireless and wired segments.
-    \item \textbf{Server:} Connected via a 100Mbps CSMA/CD link at $(0, 1, 0)$, acting as the traffic sink.
-\end{itemize}
+\subsection{2.2 Small-Scale Fading: Nakagami Model}
+To simulate multipath fading (rapid fluctuations in signal amplitude), we employed the Nakagami-$m$ distribution. The probability density function (PDF) of the received signal amplitude $r$ is given by:
 
-Routing is managed via global static routing (\texttt{Ipv4GlobalRoutingHelper}), ensuring packets traverse the AP correctly.
+\begin{equation}
+    f(r; m, \Omega) = \frac{2m^m}{\Gamma(m)\Omega^m} r^{2m-1} \exp\left(-\frac{m}{\Omega}r^2\right)
+\end{equation}
 
-\subsection{The "Realistic" Channel Model}
-To achieve a simulation fidelity of approximately 90\% compared to reality, a composite propagation model was implemented in \texttt{p3\_distance\_sweep.cc}:
+Where $m$ is the shape factor (fading severity) and $\Omega$ is the average power. In our simulation, $m$ varies with distance to model the transition from Line-of-Sight (LOS) to Non-LOS conditions.
 
-\begin{enumerate}
-    \item \textbf{Path Loss ($\gamma=3.0$):} We utilized the \texttt{LogDistancePropagationLossModel} with an exponent of 3.0. This represents a cluttered indoor environment (e.g., an office building) where signal power decays faster than in free space ($\gamma=2.0$).
-    \item \textbf{Shadowing ($\sigma=5.0$ dB):} The \texttt{CorrelatedLogNormalShadowingLossModel} introduces random variations in received power, simulating the effect of walls or furniture blocking the signal path. This makes the reception power stochastic rather than deterministic.
-    \item \textbf{Fading:} A \texttt{NakagamiPropagationLossModel} was chained to simulate fast fading due to multipath effects, adding realistic "noise" to the signal.
-\end{enumerate}
+\subsection{2.3 Throughput and Little's Law}
+We define Goodput ($G$) over the useful simulation time as:
+\begin{equation}
+    G = \frac{8 \sum B_{rx}}{T_{sim} - T_{start}}
+\end{equation}
+Where $\sum B_{rx}$ is total bytes received.
 
-\subsection{Traffic Generation}
-\begin{itemize}
-    \item \textbf{UDP Traffic:} Generated using \texttt{OnOffApplication} with a Constant Bit Rate (CBR) of 10 Mbps and 1200-byte packets. This represents real-time traffic like video streaming.
-    \item \textbf{TCP Traffic:} Generated using \texttt{BulkSendApplication}, representing file transfers that require reliable delivery.
-\end{itemize}
+For latency analysis, we refer to **Little's Law** from Queueing Theory, which states $L = \lambda W$, where $L$ is the average number of items in the queue, $\lambda$ is the arrival rate, and $W$ is the average wait time. This explains the Bufferbloat phenomenon observed in UDP tests.
+
+\section{3. Simulation Setup}
+The simulation was conducted using \textbf{ns-3 (Network Simulator 3)}. Key parameters are summarized in Table 1.
+
+\begin{table}[H]
+\centering
+\caption{Simulation Parameters}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Standard & IEEE 802.11ax (Wi-Fi 6) \\
+Frequency Band & 5 GHz (Channel Width 20/40 MHz) \\
+Tx Power & 16 dBm \\
+Noise Figure & 7 dB \\
+Rate Adaptation & Minstrel-HT \\
+AQM Discipline & FqCoDel (Flow Queue CoDel) \\
+Transport Protocols & UDP (OnOff), TCP (BulkSend) \\
+Packet Size & 1200 Bytes \\
+Simulation Distance & Sweep $\{1, 5, 10, 15, 20, 25, 30\}$ meters \\
+Runs per Distance & 5 (Distinct RNG Seeds) \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \newpage
-\section{Performance Analysis and Discussion}
+\section{4. Results and Critical Analysis}
 
-This section provides a detailed interpretation of the simulation results, explaining the physical and protocol-level reasons behind the observed behaviors.
-
-\subsection{Goodput Analysis: The "Cliff" Effect}
-Figure \ref{fig:goodput} depicts the application-level throughput (Goodput) as a function of distance.
+\subsection{4.1 Throughput Analysis: The SNR Threshold}
+Figure \ref{fig:goodput} illustrates the Goodput performance.
 
 \begin{figure}[H]
     \centering
-    % Ensure the path is correct relative to your .tex file
     \includegraphics[width=0.9\textwidth]{../../../results/p3/plots/goodput_vs_distance.png}
-    \caption{Goodput vs. Distance. The shaded regions indicate the standard deviation across 5 independent runs.}
+    \caption{Goodput vs. Distance. Shaded areas denote standard deviation ($\pm 1\sigma$).}
     \label{fig:goodput}
 \end{figure}
 
-\textbf{Detailed Observation:}
-\begin{itemize}
-    \item \textbf{UDP Performance (Orange Line):}
-    For distances between 1m and 20m, the UDP goodput is stable at approximately \textbf{6.6 Mbps}. Although the offered load is 10 Mbps, the effective goodput is lower due to the 802.11ax protocol overhead (headers, inter-frame spaces, and MAC-layer acknowledgments).
+\subsubsection*{Interpretation:}
+The results show a distinct non-linear behavior characterized by two regions:
+\begin{enumerate}
+    \item \textbf{Saturation Region ($d < 20$m):} The channel SNR is sufficiently high to support high-order modulations (e.g., 256-QAM or 1024-QAM). The throughput is limited not by the channel, but by protocol overhead (ACKs, headers). UDP achieves $\approx 6.6$ Mbps, nearing the effective limit for the configured flow.
     
-    At \textbf{30 meters}, we observe a sharp decline (the "cliff") to roughly \textbf{5 Mbps}, accompanied by a large variance (wide shaded area). This indicates that the Signal-to-Noise Ratio (SNR) has dropped to a critical level. The \texttt{MinstrelHt} rate adaptation algorithm attempts to maintain connectivity by lowering the Modulation and Coding Scheme (MCS), which reduces the data rate but increases robustness. The high variance confirms that Shadowing is active: in some runs, the random obstruction caused signal loss, while in others, it did not.
+    \item \textbf{The "Waterfall" Region ($d \geq 25$m):} At 30m, we observe a sharp drop in UDP throughput ($\approx 25\%$ loss) and a significant increase in variance. This confirms the efficacy of the Shadowing model: at the cell edge, random attenuation ($\pm 5$ dB) determines whether a packet is decodable or lost. The Minstrel algorithm reacts by downgrading the MCS index, sacrificing throughput for reliability.
+\end{enumerate}
 
-    \item \textbf{TCP Performance (Blue Line):}
-    TCP shows a lower overall throughput ($\approx 2.2$ Mbps) and a gradual decline. Unlike UDP, which blasts packets blindly, TCP waits for acknowledgments. As the distance increases and frame error rates rise, TCP frequently enters "Congestion Avoidance" or "Fast Recovery," throttling its own transmission rate to match the varying channel capacity.
-\end{itemize}
-
-\subsection{RTT Analysis: The Bufferbloat vs. Congestion Control Paradox}
-Figure \ref{fig:rtt} presents the Round Trip Time (RTT). A counter-intuitive but fascinating phenomenon is observed here.
+\subsection{4.2 Latency Analysis: Open-Loop vs. Closed-Loop Control}
+Figure \ref{fig:rtt} presents the RTT measurements, revealing a fundamental divergence between TCP and UDP.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.9\textwidth]{../../../results/p3/plots/rtt_vs_distance.png}
-    \caption{Mean Round Trip Time (RTT) vs. Distance.}
+    \caption{Mean RTT vs. Distance.}
     \label{fig:rtt}
 \end{figure}
 
-\textbf{Why does UDP latency increase while TCP latency decreases?}
-\begin{enumerate}
-    \item \textbf{UDP Mechanism (Rising Latency):} 
-    The UDP application sends data at a constant 10 Mbps regardless of network conditions. At 30m, the effective wireless bandwidth drops (due to lower MCS and retransmissions). Since the \textbf{Sending Rate > Channel Capacity}, packets pile up in the AP and STA transmission queues. This phenomenon, known as \textbf{Bufferbloat}, causes packets to wait in the queue, significantly increasing the RTT (from $\approx 145$ms to $\approx 175$ms).
+\subsubsection*{Mathematical Explanation of Divergence:}
+\begin{itemize}
+    \item \textbf{UDP (Open-Loop):} The application injects packets at a constant rate $\lambda_{in} = 10$ Mbps. At $d=30$m, the effective service rate of the channel $\mu$ drops below $\lambda_{in}$ ($\mu < \lambda$). According to queueing theory, the queue length $L$ grows indefinitely (until buffer overflow), increasing the waiting time $W$. This is **Bufferbloat**.
     
-    \item \textbf{TCP Mechanism (Falling Latency):} 
-    TCP creates a feedback loop. When the wireless link degrades at 30m, packet losses occur. TCP interprets these losses as network congestion and drastically reduces its \textbf{Congestion Window (CWND)}. By slowing down, TCP prevents the queue from filling up. An empty queue results in very low queuing delay, explaining why the TCP RTT drops to $\approx 60$ms at long range. This proves the simulation correctly models the transport layer's reaction to physical layer impairments.
-\end{enumerate}
+    \item \textbf{TCP (Closed-Loop):} TCP employs a congestion control loop. The sending rate $\lambda_{tcp}(t)$ is a function of packet loss probability $p$.
+    \begin{equation}
+        \lambda_{tcp} \approx \frac{MSS}{RTT \sqrt{p}}
+    \end{equation}
+    As distance increases, fading causes packet loss ($p \uparrow$). Consequently, TCP reduces $\lambda_{tcp}$ to match the bottleneck capacity ($\lambda_{tcp} \approx \mu$). This prevents queue buildup ($L \approx 0$), resulting in minimal queuing delay and surprisingly lower RTT.
+\end{itemize}
 
-\subsection{Stability Analysis at the Cell Edge}
-To visualize the instability at 30 meters, we analyze the instantaneous throughput over time (Time Series).
+\subsection{4.3 Temporal Stability Analysis}
+The stochastic nature of the channel is best visualized in the time domain (Figure \ref{fig:stability}).
 
 \begin{figure}[H]
     \centering
-    \begin{subfigure}{0.9\textwidth}
-        \centering
-        \includegraphics[width=\linewidth]{../../../results/p3/plots/timeseries_d1m.png}
-        \caption{Distance = 1m (Stable Connection)}
-    \end{subfigure}
-    \vspace{0.5cm}
-    \begin{subfigure}{0.9\textwidth}
+    \begin{subfigure}{0.85\textwidth}
         \centering
         \includegraphics[width=\linewidth]{../../../results/p3/plots/timeseries_d30m.png}
-        \caption{Distance = 30m (Intermittent Connection)}
+        \caption{Distance = 30m (Cell Edge)}
     \end{subfigure}
-    \caption{Comparison of Throughput Stability over Time (UDP).}
+    \caption{Instantaneous Throughput (UDP) at Cell Edge.}
     \label{fig:stability}
 \end{figure}
 
-As shown in Figure \ref{fig:stability}, the connection at 1m is perfectly stable. However, at 30m, the throughput exhibits an \textbf{"On/Off" behavior}. For several seconds (e.g., $t=2$ to $t=10$), the throughput drops to near zero. This corresponds to deep fading events where the received power drops below the sensitivity threshold of the receiver. This intermittency is a hallmark of realistic wireless simulations at the coverage edge.
+At 30m, the throughput exhibits binary "On/Off" behavior. The periods of zero throughput correspond to deep fading events where the instantaneous received power falls below the receiver sensitivity threshold (e.g., $-82$ dBm). This proves that the simulation correctly captures the temporal correlation of the fading channel.
 
-\section{Conclusion}
-This part successfully implemented a high-fidelity simulation of a Wi-Fi 6 network. By integrating Log-Distance path loss, Shadowing, and Fading, we observed realistic network behaviors that simpler models fail to capture.
-
-\textbf{Key Findings:}
-\begin{itemize}
-    \item Distance has a non-linear impact on performance. The network maintains high performance up to a specific threshold ($\approx 25$m), after which performance degrades rapidly.
-    \item Transport protocols react differently to weak signals: UDP saturates queues leading to high latency, while TCP throttles back, maintaining low latency but lower throughput.
-    \item The variability introduced by the stochastic models necessitates multiple simulation runs to obtain statistically significant results.
-\end{itemize}
-
-The simulation results align with theoretical expectations and provide valuable insights into the challenges of wireless network planning in complex indoor environments.
+\section{5. Conclusion}
+This research demonstrates that realistic wireless network simulation requires more than simple deterministic models. By integrating Log-Normal Shadowing and Nakagami Fading, we showed that:
+\begin{enumerate}
+    \item \textbf{Coverage is probabilistic, not geometric:} The "range" of an AP is not a fixed circle but a transition zone defined by outage probability.
+    \item \textbf{Transport Protocol Interaction:} The interaction between physical layer errors and transport layer flow control is critical. While UDP maximizes throughput at the cost of latency (Bufferbloat), TCP sacrifices throughput to maintain low latency and reliability.
+\end{enumerate}
+These findings underscore the necessity of Active Queue Management (AQM) and robust link adaptation in next-generation Wi-Fi deployments.
 
 \end{document}
