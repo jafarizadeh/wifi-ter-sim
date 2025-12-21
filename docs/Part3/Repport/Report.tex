@@ -1,0 +1,160 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{subcaption}
+\usepackage{amsmath}
+
+\geometry{top=2.5cm, bottom=2.5cm, left=2.5cm, right=2.5cm}
+
+% Setup for code listings
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{red}
+}
+
+\title{\textbf{Part 3: Advanced Analysis of Wi-Fi 6 Performance}\\
+\large Impact of Distance and Realistic Propagation Models}
+\author{JAFARIZADEH Mehdi}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report presents a detailed analysis of the performance of an IEEE 802.11ax (Wi-Fi 6) network under realistic channel conditions. Unlike basic simulations that assume a deterministic environment, this study incorporates stochastic elements including Log-Distance path loss, Log-Normal Shadowing, and Nakagami Fading. By performing an automated sweep of distances ranging from 1 to 30 meters, we evaluate the impact of signal degradation on Goodput and Round Trip Time (RTT) for both UDP and TCP protocols. The results highlight the "Cell Edge" phenomenon and demonstrate the distinct flow-control behaviors of transport layer protocols in lossy wireless environments.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction and Objectives}
+Wireless networks in real-world environments are subject to various impairments such as signal attenuation over distance, obstruction by objects (shadowing), and multipath propagation (fading). The objective of this part is to simulate these phenomena using \textbf{ns-3} to create a "digital twin" of a realistic indoor Wi-Fi scenario.
+
+Specific goals include:
+\begin{itemize}
+    \item Moving beyond the ideal "Friis" model to a more complex \textbf{LogDistance + Shadowing + Fading} model.
+    \item Quantifying the "Goodput Cliff" — the distance at which the link becomes unusable.
+    \item Analyzing the latency (RTT) dynamics: specifically, why TCP and UDP latencies diverge at the cell edge.
+    \item Assessing the stability of the connection using time-series analysis.
+\end{itemize}
+
+\section{Simulation Methodology}
+
+\subsection{Topology and Network Stack}
+The simulation setup involves a linear topology consisting of three nodes:
+\begin{itemize}
+    \item \textbf{Station (STA):} A mobile Wi-Fi 6 client located at coordinates $(d, 0, 0)$, where $d$ varies from 1m to 30m.
+    \item \textbf{Access Point (AP):} Located at $(0, 0, 0)$, bridging the wireless and wired segments.
+    \item \textbf{Server:} Connected via a 100Mbps CSMA/CD link at $(0, 1, 0)$, acting as the traffic sink.
+\end{itemize}
+
+Routing is managed via global static routing (\texttt{Ipv4GlobalRoutingHelper}), ensuring packets traverse the AP correctly.
+
+\subsection{The "Realistic" Channel Model}
+To achieve a simulation fidelity of approximately 90\% compared to reality, a composite propagation model was implemented in \texttt{p3\_distance\_sweep.cc}:
+
+\begin{enumerate}
+    \item \textbf{Path Loss ($\gamma=3.0$):} We utilized the \texttt{LogDistancePropagationLossModel} with an exponent of 3.0. This represents a cluttered indoor environment (e.g., an office building) where signal power decays faster than in free space ($\gamma=2.0$).
+    \item \textbf{Shadowing ($\sigma=5.0$ dB):} The \texttt{CorrelatedLogNormalShadowingLossModel} introduces random variations in received power, simulating the effect of walls or furniture blocking the signal path. This makes the reception power stochastic rather than deterministic.
+    \item \textbf{Fading:} A \texttt{NakagamiPropagationLossModel} was chained to simulate fast fading due to multipath effects, adding realistic "noise" to the signal.
+\end{enumerate}
+
+\subsection{Traffic Generation}
+\begin{itemize}
+    \item \textbf{UDP Traffic:} Generated using \texttt{OnOffApplication} with a Constant Bit Rate (CBR) of 10 Mbps and 1200-byte packets. This represents real-time traffic like video streaming.
+    \item \textbf{TCP Traffic:} Generated using \texttt{BulkSendApplication}, representing file transfers that require reliable delivery.
+\end{itemize}
+
+\newpage
+\section{Performance Analysis and Discussion}
+
+This section provides a detailed interpretation of the simulation results, explaining the physical and protocol-level reasons behind the observed behaviors.
+
+\subsection{Goodput Analysis: The "Cliff" Effect}
+Figure \ref{fig:goodput} depicts the application-level throughput (Goodput) as a function of distance.
+
+\begin{figure}[H]
+    \centering
+    % Ensure the path is correct relative to your .tex file
+    \includegraphics[width=0.9\textwidth]{../../../results/p3/plots/goodput_vs_distance.png}
+    \caption{Goodput vs. Distance. The shaded regions indicate the standard deviation across 5 independent runs.}
+    \label{fig:goodput}
+\end{figure}
+
+\textbf{Detailed Observation:}
+\begin{itemize}
+    \item \textbf{UDP Performance (Orange Line):}
+    For distances between 1m and 20m, the UDP goodput is stable at approximately \textbf{6.6 Mbps}. Although the offered load is 10 Mbps, the effective goodput is lower due to the 802.11ax protocol overhead (headers, inter-frame spaces, and MAC-layer acknowledgments).
+    
+    At \textbf{30 meters}, we observe a sharp decline (the "cliff") to roughly \textbf{5 Mbps}, accompanied by a large variance (wide shaded area). This indicates that the Signal-to-Noise Ratio (SNR) has dropped to a critical level. The \texttt{MinstrelHt} rate adaptation algorithm attempts to maintain connectivity by lowering the Modulation and Coding Scheme (MCS), which reduces the data rate but increases robustness. The high variance confirms that Shadowing is active: in some runs, the random obstruction caused signal loss, while in others, it did not.
+
+    \item \textbf{TCP Performance (Blue Line):}
+    TCP shows a lower overall throughput ($\approx 2.2$ Mbps) and a gradual decline. Unlike UDP, which blasts packets blindly, TCP waits for acknowledgments. As the distance increases and frame error rates rise, TCP frequently enters "Congestion Avoidance" or "Fast Recovery," throttling its own transmission rate to match the varying channel capacity.
+\end{itemize}
+
+\subsection{RTT Analysis: The Bufferbloat vs. Congestion Control Paradox}
+Figure \ref{fig:rtt} presents the Round Trip Time (RTT). A counter-intuitive but fascinating phenomenon is observed here.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{../../../results/p3/plots/rtt_vs_distance.png}
+    \caption{Mean Round Trip Time (RTT) vs. Distance.}
+    \label{fig:rtt}
+\end{figure}
+
+\textbf{Why does UDP latency increase while TCP latency decreases?}
+\begin{enumerate}
+    \item \textbf{UDP Mechanism (Rising Latency):} 
+    The UDP application sends data at a constant 10 Mbps regardless of network conditions. At 30m, the effective wireless bandwidth drops (due to lower MCS and retransmissions). Since the \textbf{Sending Rate > Channel Capacity}, packets pile up in the AP and STA transmission queues. This phenomenon, known as \textbf{Bufferbloat}, causes packets to wait in the queue, significantly increasing the RTT (from $\approx 145$ms to $\approx 175$ms).
+    
+    \item \textbf{TCP Mechanism (Falling Latency):} 
+    TCP creates a feedback loop. When the wireless link degrades at 30m, packet losses occur. TCP interprets these losses as network congestion and drastically reduces its \textbf{Congestion Window (CWND)}. By slowing down, TCP prevents the queue from filling up. An empty queue results in very low queuing delay, explaining why the TCP RTT drops to $\approx 60$ms at long range. This proves the simulation correctly models the transport layer's reaction to physical layer impairments.
+\end{enumerate}
+
+\subsection{Stability Analysis at the Cell Edge}
+To visualize the instability at 30 meters, we analyze the instantaneous throughput over time (Time Series).
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.9\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{../../../results/p3/plots/timeseries_d1m.png}
+        \caption{Distance = 1m (Stable Connection)}
+    \end{subfigure}
+    \vspace{0.5cm}
+    \begin{subfigure}{0.9\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{../../../results/p3/plots/timeseries_d30m.png}
+        \caption{Distance = 30m (Intermittent Connection)}
+    \end{subfigure}
+    \caption{Comparison of Throughput Stability over Time (UDP).}
+    \label{fig:stability}
+\end{figure}
+
+As shown in Figure \ref{fig:stability}, the connection at 1m is perfectly stable. However, at 30m, the throughput exhibits an \textbf{"On/Off" behavior}. For several seconds (e.g., $t=2$ to $t=10$), the throughput drops to near zero. This corresponds to deep fading events where the received power drops below the sensitivity threshold of the receiver. This intermittency is a hallmark of realistic wireless simulations at the coverage edge.
+
+\section{Conclusion}
+This part successfully implemented a high-fidelity simulation of a Wi-Fi 6 network. By integrating Log-Distance path loss, Shadowing, and Fading, we observed realistic network behaviors that simpler models fail to capture.
+
+\textbf{Key Findings:}
+\begin{itemize}
+    \item Distance has a non-linear impact on performance. The network maintains high performance up to a specific threshold ($\approx 25$m), after which performance degrades rapidly.
+    \item Transport protocols react differently to weak signals: UDP saturates queues leading to high latency, while TCP throttles back, maintaining low latency but lower throughput.
+    \item The variability introduced by the stochastic models necessitates multiple simulation runs to obtain statistically significant results.
+\end{itemize}
+
+The simulation results align with theoretical expectations and provide valuable insights into the challenges of wireless network planning in complex indoor environments.
+
+\end{document}
