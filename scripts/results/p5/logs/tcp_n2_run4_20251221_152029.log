@@ -1,0 +1,16 @@
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+msg="Attribute name=ChannelWidth is not settable for this object: tid=ns3::YansWifiPhy", +0.000000000s -1 file=/home/lord/ns-3/src/core/model/object-base.cc, line=223
+NS_FATAL, terminating
+   0# ns3::ObjectBase::SetAttribute(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, ns3::AttributeValue const&) at /home/lord/ns-3/src/core/model/object-base.cc:223
+   1# SetChannelWidthAfterInstall at /home/lord/ns-3/scratch/p5_multi_sta_fairness.cc:119
+   2# main at /home/lord/ns-3/scratch/p5_multi_sta_fairness.cc:290
+   3# __libc_start_call_main at ../sysdeps/nptl/libc_start_call_main.h:58
+   4# __libc_start_main_impl at ../csu/libc-start.c:360
+   5# _start at :0
+   6# 
+
+terminate called without an active exception
+Command 'build/scratch/ns3-dev-p5_multi_sta_fairness-default --simTime=20 --appStart=2 --nSta=2 --distance=10 --radius=10 --transport=tcp --pktSize=1200 --udpRatePerSta=10Mbps --tcpMaxBytes=0 --interval=0.5 --pcap=false --flowmon=true --seed=1 --run=4 --outDir=results/p5 --channelWidth=20 --txPowerDbm=20 --noiseFigureDb=7 --logExp=3 --refDist=1 --refLoss=46.6777 --rateManager=ns3::MinstrelHtWifiManager' died with <Signals.SIGABRT: 6>.
