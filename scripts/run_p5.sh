@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # scripts/run_p5.sh
 # Projet 5 — Run UDP/TCP fairness experiments for N={2,5,10}
+# Compatible with the CommandLine parameters in your current p5_multi_sta_fairness.cc
 
 set -u
 set -o pipefail
 
+# -------------------- config --------------------
 NS3_DIR="${NS3_DIR:-$HOME/ns-3}"
-SCENARIO="scratch/p5_multi_sta_fairness"
 
-OUTDIR="${OUTDIR:-results/p5}"
+# For scratch programs, this form is reliable across ns-3 setups:
+SCENARIO="${SCENARIO:-scratch/p5_multi_sta_fairness}"
+
+OUTDIR="${OUTDIR:-$HOME/wifi-ter-sim/results/p5}"
 
 SIMTIME="${SIMTIME:-20}"
-APPSTART="${APPSTART:-2}"
+APPSTART="${APPSTART:-3}"
 DISTANCE="${DISTANCE:-10}"
 RADIUS="${RADIUS:-10}"
 
@@ -27,30 +31,23 @@ FLOWMON="${FLOWMON:-true}"
 SEED="${SEED:-1}"
 RUN_BASE="${RUN_BASE:-1}"
 
-CHANNEL_WIDTH="${CHANNEL_WIDTH:-20}"
-TXPOWER_DBM="${TXPOWER_DBM:-20}"
-NOISE_FIGURE_DB="${NOISE_FIGURE_DB:-7}"
-LOGEXP="${LOGEXP:-3}"
-REFDIST="${REFDIST:-1}"
-REFLOSS="${REFLOSS:-46.6777}"
-RATE_MANAGER="${RATE_MANAGER:-ns3::MinstrelHtWifiManager}"
-
 NSTAS=(2 5 10)
 
+# -------------------- helpers --------------------
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-if [[ ! -d "$NS3_DIR" ]]; then
-  die "NS3_DIR not found: $NS3_DIR"
-fi
+# -------------------- checks --------------------
+[[ -d "$NS3_DIR" ]] || die "NS3_DIR not found: $NS3_DIR"
 
 mkdir -p "$OUTDIR/raw" "$OUTDIR/logs" "$OUTDIR/plots"
 
+# -------------------- build once --------------------
 echo "[P5] Building ns-3 in: $NS3_DIR"
 ( cd "$NS3_DIR" && ./ns3 build ) || die "ns-3 build failed"
 
+timestamp="$(date +%Y%m%d_%H%M%S)"
 FAIL=0
 IDX=0
-timestamp="$(date +%Y%m%d_%H%M%S)"
 
 run_one () {
   local transport="$1"
@@ -62,33 +59,27 @@ run_one () {
 
   echo "[P5] Running transport=$transport nSta=$nsta run=$runnum (log: $log)"
 
-  # ✅ مهم: در نسخه‌ی شما نباید جداکننده‌ی "--" بعد از سناریو بیاید
+  # IMPORTANT: Only pass arguments that exist in your C++ CommandLine.
   ( cd "$NS3_DIR" && \
-    ./ns3 run "$SCENARIO \
-      --simTime=${SIMTIME} \
-      --appStart=${APPSTART} \
-      --nSta=${nsta} \
-      --distance=${DISTANCE} \
-      --radius=${RADIUS} \
-      --transport=${transport} \
-      --pktSize=${PKTSIZE} \
-      --udpRatePerSta=${UDP_RATE_PER_STA} \
-      --tcpMaxBytes=${TCP_MAXBYTES} \
-      --interval=${INTERVAL} \
-      --pcap=${PCAP} \
-      --flowmon=${FLOWMON} \
-      --seed=${SEED} \
-      --run=${runnum} \
-      --outDir=${OUTDIR} \
-      --channelWidth=${CHANNEL_WIDTH} \
-      --txPowerDbm=${TXPOWER_DBM} \
-      --noiseFigureDb=${NOISE_FIGURE_DB} \
-      --logExp=${LOGEXP} \
-      --refDist=${REFDIST} \
-      --refLoss=${REFLOSS} \
-      --rateManager=${RATE_MANAGER} \
-    " \
+    ./ns3 run "${SCENARIO} \
+--simTime=${SIMTIME} \
+--appStart=${APPSTART} \
+--nSta=${nsta} \
+--distance=${DISTANCE} \
+--radius=${RADIUS} \
+--ssid=wifi6-ter \
+--outDir=${OUTDIR} \
+--pcap=${PCAP} \
+--flowmon=${FLOWMON} \
+--seed=${SEED} \
+--run=${runnum} \
+--transport=${transport} \
+--pktSize=${PKTSIZE} \
+--udpRatePerSta=${UDP_RATE_PER_STA} \
+--interval=${INTERVAL} \
+" \
   ) >"$log" 2>&1
+
 
   if [[ $? -ne 0 ]]; then
     echo "[P5] FAILED: transport=$transport nSta=$nsta run=$runnum"
@@ -97,24 +88,29 @@ run_one () {
   fi
 }
 
+# UDP series (3 runs)
 for nsta in "${NSTAS[@]}"; do
   runnum=$((RUN_BASE + IDX))
   run_one "udp" "$nsta" "$runnum"
   IDX=$((IDX + 1))
 done
 
+# TCP series (3 runs)
 for nsta in "${NSTAS[@]}"; do
   runnum=$((RUN_BASE + IDX))
   run_one "tcp" "$nsta" "$runnum"
   IDX=$((IDX + 1))
 done
 
+# -------------------- sanity checks --------------------
 echo "[P5] Sanity checks..."
+
 SUMMARY="$OUTDIR/raw/p5_summary.csv"
-if [[ -f "$SUMMARY" ]]; then
-  echo "[P5] Summary lines (incl header): $(wc -l < "$SUMMARY")"
-else
+if [[ ! -f "$SUMMARY" ]]; then
   echo "[P5] WARNING: summary not found: $SUMMARY"
+else
+  echo "[P5] Summary path: $SUMMARY"
+  echo "[P5] Summary lines (including header): $(wc -l < "$SUMMARY")"
 fi
 
 if [[ $FAIL -ne 0 ]]; then
@@ -123,4 +119,9 @@ if [[ $FAIL -ne 0 ]]; then
 fi
 
 echo "[P5] All runs completed successfully."
-echo "[P5] Outputs are under: $OUTDIR/"
+echo "[P5] Outputs:"
+echo "  - $OUTDIR/raw/persta_*.csv"
+echo "  - $OUTDIR/raw/p5_summary.csv"
+echo "  - $OUTDIR/logs/*.log"
+echo "  - $OUTDIR/raw/flowmon_*.xml (if flowmon=true)"
+echo "  - $OUTDIR/raw/ts_*.csv (if enabled by scenario)"

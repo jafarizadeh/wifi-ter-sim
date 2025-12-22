@@ -1,0 +1,6 @@
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[P5] apWifiIp=10.1.0.3 apCsmaIp=10.2.0.1 serverIp=10.2.0.2
+[P5] transport=udp nSta=2 effectiveDistance=10 pktSize=1200 rateManager=ns3::MinstrelHtWifiManager seed=1 run=1 sumGoodput(Mbps)=19.9906 jain=1

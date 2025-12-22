@@ -1,0 +1,227 @@
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\title{P5 Tutorial: Multi-STA Fairness and Goodput Analysis (ns-3 Wi-Fi)}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\graphicspath{{./}{./figures/}}
+
+This tutorial explains how to study \emph{fairness} and \emph{goodput} in a multi-station (multi-STA) Wi-Fi scenario in ns-3, and how to interpret the resulting plots and CSV outputs. The goal is not just to ``produce charts'', but to understand \emph{why} the curves and bars look the way they do and what they imply about the MAC layer, rate adaptation, and transport protocols (UDP vs.\ TCP).
+
+\vspace{0.5em}
+\noindent\textbf{Scenario in one paragraph.}
+The simulation contains an AP and multiple STAs on a Wi-Fi network (10.1.0.0/24). The AP connects to a server over a CSMA wired link (10.2.0.0/24). Each STA sends traffic to the server using a unique destination port. The experiment is repeated for different numbers of STAs ($N$) and for two transports: UDP (OnOff) and TCP (BulkSend). For each run, we record per-STA received bytes (from packet sinks), compute per-STA goodput, aggregate goodput, and Jain’s fairness index. The key question is: \emph{as contention grows with $N$, how do throughput and fairness change, and how does this differ between UDP and TCP?}
+
+\section*{1.\ \ Metrics and why we use them}
+
+\textbf{Goodput vs.\ throughput.} In network experiments, \emph{throughput} often means the total bits delivered to the receiver per unit time. \emph{Goodput} is more specific: it counts only useful application-layer data delivered, excluding extra protocol overhead and (depending on measurement point) retransmissions. In this project, the application packet size is \SI{1200}{B}. The sink receives application payload bytes, so the computed goodput is effectively the rate of useful bytes delivered to the application.
+
+If STA $i$ receives $B_i$ bytes during the \emph{useful time} window $T = (t_{\text{stop}} - t_{\text{start}})$, then
+
+\begin{equation}
+G_i \;=\; \frac{8 B_i}{T} \quad [\mathrm{bps}],
+\qquad
+G^{(\mathrm{Mbps})}_i \;=\; \frac{G_i}{10^6}.
+\end{equation}
+
+The \emph{sum goodput} is the aggregate:
+
+\begin{equation}
+G_{\text{sum}} \;=\; \sum_{i=1}^{N} G_i.
+\end{equation}
+
+\textbf{Fairness (Jain’s index).} A very common fairness metric in networking is Jain’s fairness index:
+
+\begin{equation}
+J(\mathbf{G}) \;=\; \frac{\left(\sum_{i=1}^{N} G_i\right)^2}{N \sum_{i=1}^{N} G_i^2},
+\qquad 0 < J \le 1.
+\end{equation}
+
+If all STAs receive exactly the same goodput, $G_1=\cdots=G_N$, then $J=1$ (perfect fairness). As goodput becomes more uneven, $J$ decreases. This metric is especially useful because it summarizes distribution \emph{shape} in a single number.
+
+\textbf{How to read $J$.} Values close to 1 (e.g.\ 0.95--1.0) indicate near-equal sharing; values around 0.8 mean noticeable imbalance (some STAs obtain much more than others). Importantly, fairness does not imply high throughput: you can be very fair but slow (everyone gets little), or unfair but fast (some users dominate).
+
+\section*{2.\ \ What outputs mean (CSV files) and how the plots are built}
+
+Two CSV outputs matter most here:
+
+\begin{itemize}
+\item \texttt{p5\_summary.csv}: one row per experiment (transport, $N$, run). It contains aggregate goodput (\texttt{sumGoodputbps}) and fairness (\texttt{jain}), plus configuration fields like packet size and rate manager.
+\item \texttt{persta\_\{udp|tcp\}\_nN\_runR.csv}: one file per experiment, containing STA ID, received bytes, and per-STA goodput.
+\end{itemize}
+
+Even though these look simple, they encode most of the experiment story. The line plots (Jain vs.\ $N$, Sum Goodput vs.\ $N$) come from \texttt{p5\_summary.csv}. The bar charts (Per-STA Goodput) come from the per-STA files.
+
+\subsection*{A quick numeric sanity-check}
+For UDP, $N=2$, the summary line shows:
+\[
+G_{\text{sum}} \approx 19.9906~\mathrm{Mbps}, \qquad J=1.0.
+\]
+From \texttt{persta\_udp\_n2\_run1.csv}, each STA receives about \SI{21.24}{MB} over $T=17$ seconds (from $t_{\text{start}}=3$ to $t_{\text{stop}}=20$). For STA0, $B_0 \approx 21{,}236{,}400$ bytes, so
+\[
+G_0 \approx \frac{8\times 21{,}236{,}400}{17} \approx 9.9936~\mathrm{Mbps}.
+\]
+STA1 is essentially the same, so the sum is about \SI{19.99}{Mbps} and the fairness is effectively 1. This is exactly what we want: the numbers are internally consistent.
+
+\section*{3.\ \ The key results (your dataset) in one table}
+
+Table~\ref{tab:summary} summarizes the main outcomes used in the plots.
+
+\begin{table}[h!]
+\centering
+\small
+\sisetup{round-mode=places,round-precision=3}
+\begin{tabular}{@{}llrr@{}}
+\toprule
+Transport & $N$ (STAs) & $G_{\text{sum}}$ (Mbps) & Jain $J$ \\
+\midrule
+UDP & 2  & 19.991 & 1.000000 \\
+UDP & 5  & 43.091 & 0.997598 \\
+UDP & 10 & 39.710 & 0.822121 \\
+TCP & 2  & 31.778 & 0.996076 \\
+TCP & 5  & 31.307 & 0.959864 \\
+TCP & 10 & 30.403 & 0.949647 \\
+\bottomrule
+\end{tabular}
+\caption{Aggregate goodput and fairness from \texttt{p5\_summary.csv} (converted to Mbps).}
+\label{tab:summary}
+\end{table}
+
+Two immediate patterns stand out:
+(1) UDP aggregate goodput \emph{increases strongly} from $N=2$ to $N=5$, then \emph{drops} at $N=10$.
+(2) TCP aggregate goodput is \emph{relatively stable} across $N$, but fairness slightly decreases as $N$ grows.
+
+The rest of the tutorial explains \emph{why these patterns make sense}.
+
+\section*{4.\ \ Interpreting Jain Fairness vs.\ $N$}
+
+Figure~\ref{fig:jain} shows Jain’s fairness index as $N$ increases for UDP and TCP.
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=0.92\linewidth]{required_jain_vs_n.png}
+\caption{Jain fairness index vs.\ number of STAs for UDP and TCP.}
+\label{fig:jain}
+\end{figure}
+
+\textbf{UDP: near-perfect fairness at small/medium $N$, then a sharp drop at $N=10$.}
+With UDP OnOff traffic, each STA tries to send at a fixed offered rate (e.g.\ \SI{10}{Mbps} per STA in your run script). When $N$ is small, the medium has enough capacity and airtime sharing remains close to equal, so $J\approx 1$. At $N=5$, fairness is still almost perfect ($J \approx 0.998$), indicating that the MAC is distributing airtime in an even way for most stations.
+
+The drop at $N=10$ ($J \approx 0.822$) indicates that not all STAs are receiving similar goodput anymore. This is typical when contention becomes heavy and the system enters a regime where \emph{small differences amplify}. In Wi-Fi, small differences can come from:
+rate adaptation (some STAs transmit at a lower PHY rate and consume more airtime per packet), collisions and backoff randomness, capture effects (one signal may be decoded successfully while others collide), and queueing dynamics at the AP/STA. With more contenders, the probability that some nodes experience consistently worse conditions increases, and those nodes can fall behind for long periods, reducing fairness.
+
+\textbf{TCP: consistently high fairness with mild degradation.}
+TCP’s fairness values are high across the board ($J\approx 0.95$--0.996). That is expected because TCP congestion control provides a feedback loop: if a flow receives less service (due to collisions or lower PHY rate), it sees more delay/loss and reduces its sending window. This tends to \emph{pull} flows toward a more balanced operating point. As $N$ grows, some divergence still appears (e.g.\ due to different RTTs, contention windows, or station rates), so fairness drops slightly, but it does not collapse the way UDP does at $N=10$.
+
+\textbf{Important interpretation rule.}
+When $J$ drops, it does \emph{not} necessarily mean the network got ``worse'' overall; it means \emph{sharing became less equal}. You must read Figure~\ref{fig:jain} together with sum goodput (next section).
+
+\section*{5.\ \ Interpreting Sum Goodput vs.\ $N$}
+
+Figure~\ref{fig:sum} shows aggregate delivered goodput.
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=0.92\linewidth]{required_sum_goodput_vs_n.png}
+\caption{Aggregate (sum) goodput vs.\ number of STAs for UDP and TCP.}
+\label{fig:sum}
+\end{figure}
+
+\textbf{Why does UDP sum goodput jump from $N=2$ to $N=5$?}
+At $N=2$, the aggregate UDP goodput is about \SI{20}{Mbps}. With five STAs, it rises to about \SI{43}{Mbps}. This does not mean ``adding users always increases capacity''. It means that at low $N$, the offered load may not fully utilize the wireless medium (or some protocol overhead dominates), while at $N=5$ the aggregate offered load pushes the network closer to its operating capacity, filling idle times and improving utilization.
+
+Another contributing factor is that CSMA (wired) is not the bottleneck (it is \SI{1}{Gbps} with small delay). The bottleneck is the shared Wi-Fi medium. When more STAs generate traffic, the medium becomes busier, increasing utilization—up to a point.
+
+\textbf{Why does UDP sum goodput decrease at $N=10$?}
+At $N=10$, UDP sum goodput falls to about \SI{39.7}{Mbps}. With many contenders, collision probability and backoff overhead increase, and a larger fraction of airtime is consumed by contention, retransmissions, and PHY/MAC overhead. Also, if some STAs end up transmitting at lower rates (due to rate control decisions), they consume more airtime for the same payload, reducing total goodput. This is the classic \emph{contention-limited} regime: more senders cause diminishing returns and eventually reduce throughput.
+
+This drop coincides with the fairness collapse in Figure~\ref{fig:jain}. That combination is especially informative: not only does the total delivered data drop, but it also becomes unevenly distributed.
+
+\textbf{Why is TCP sum goodput relatively flat across $N$?}
+TCP aggregate goodput is about \SI{31.8}{Mbps} at $N=2$ and stays around \SI{30}{--}\SI{31}{Mbps} as $N$ increases. TCP reacts to congestion by reducing sending rates, preventing the network from entering a highly unstable, collision-heavy regime. In other words, TCP traffic ``self-regulates'' and often stabilizes the operating point of the medium, trading off peak aggregate goodput for stability. That is why TCP can show a lower peak than UDP at $N=5$ (UDP reaches \SI{43}{Mbps}) while maintaining higher fairness and avoiding a dramatic drop at $N=10$.
+
+A useful mental model is:
+\begin{quote}
+UDP behaves like ``always push''; TCP behaves like ``push, observe congestion, then adapt''.
+\end{quote}
+
+\section*{6.\ \ Reading the per-STA bar charts (distribution matters)}
+
+Per-STA bar charts are where fairness becomes visually obvious: equal bars mean fair sharing; uneven bars mean imbalance. Figures~\ref{fig:udp_bars} and \ref{fig:tcp_bars} show the per-STA distributions for UDP and TCP at $N=\{2,5,10\}$.
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=0.9\linewidth]{required_persta_udp_n2_run1.png}\par\vspace{0.8em}
+\includegraphics[width=0.9\linewidth]{required_persta_udp_n5_run2.png}\par\vspace{0.8em}
+\includegraphics[width=0.9\linewidth]{required_persta_udp_n10_run3.png}
+\caption{Per-STA UDP goodput. As $N$ grows, variability increases; at $N=10$ the imbalance becomes clear, consistent with $J=0.822$.}
+\label{fig:udp_bars}
+\end{figure}
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=0.9\linewidth]{required_persta_tcp_n2_run4.png}\par\vspace{0.8em}
+\includegraphics[width=0.9\linewidth]{required_persta_tcp_n5_run5.png}\par\vspace{0.8em}
+\includegraphics[width=0.9\linewidth]{required_persta_tcp_n10_run6.png}
+\caption{Per-STA TCP goodput. Distributions remain relatively balanced compared to UDP at the same $N$, consistent with $J\approx 0.95$--0.996.}
+\label{fig:tcp_bars}
+\end{figure}
+
+\textbf{How to connect bar charts to Jain’s index.}
+Jain’s index is sensitive to the \emph{squared} rates in the denominator. If one STA is much larger than others, $G_i^2$ increases strongly, pulling $J$ down. That is why the $N=10$ UDP bars (some high, some low) translate into $J\approx 0.822$ even though several STAs still have decent throughput.
+
+\textbf{Why do per-STA rates spread out at larger $N$?}
+In an idealized symmetric setup, all STAs are at the same distance and should have similar channel conditions. Yet Wi-Fi is not purely deterministic: backoff and collision processes are random. With more contenders, the stochastic variations persist longer (some flows have ``bad luck'' for longer). Additionally, the rate control algorithm may occasionally pick different MCS levels due to transient success/failure histories, and those decisions affect airtime consumption. The combined effect is a wider distribution as $N$ increases.
+
+\section*{7.\ \ A deeper explanation: MAC airtime, overhead, and transport dynamics}
+
+At the Wi-Fi MAC layer, each successful frame transmission requires:
+contention/backoff time, PHY preamble and headers, MAC headers, inter-frame spaces, ACKs, and possibly retransmissions. When $N$ increases, the channel sees more attempts per unit time, increasing collision probability. Collisions waste airtime and force exponential backoff, so the fraction of airtime used for \emph{useful payload} decreases.
+
+UDP does not reduce its offered load when collisions happen. If the senders collectively offer more than the network can deliver, queues build up, collision probability increases, and performance can degrade. This is why UDP can achieve very high aggregate throughput at moderate $N$ but can lose both fairness and throughput at large $N$.
+
+TCP behaves differently because its end-to-end control loop reduces the number of packets injected when congestion is detected. That often keeps the network from saturating too aggressively, producing smoother performance across $N$ and more stable fairness. However, TCP also adds overhead (ACKs, congestion window growth dynamics) and may underutilize the channel in certain regimes, so its aggregate goodput may not reach the UDP peak.
+
+\section*{8.\ \ Practical guidance: how to validate and extend the analysis}
+
+A good analysis workflow is:
+\emph{(i)} verify internal consistency (per-STA sums match summary),
+\emph{(ii)} interpret fairness and aggregate throughput jointly,
+\emph{(iii)} look for mechanisms in logs/FlowMonitor that explain anomalies.
+
+If you need to go deeper, the following are effective:
+\begin{itemize}
+\item Use FlowMonitor XML to extract per-flow delay/loss and verify whether unfairness is driven by loss bursts or persistent rate differences.
+\item Compare different rate managers (e.g.\ Minstrel vs.\ constant rate) to isolate the role of rate adaptation.
+\item Repeat with multiple random seeds/runs and plot mean $\pm$ variability; single runs can be influenced by random contention outcomes.
+\end{itemize}
+
+\textbf{Common pitfall (and what you fixed).}
+Trace callback signatures in ns-3 can vary by version. If you connect a callback with a mismatched signature, ns-3 will terminate with an ``Incompatible types'' fatal error. The robust approach is either to match the exact traced callback type for your ns-3 version or to connect only the traces that you actually need. Once you fixed the Drop trace signature mismatch, your runs completed successfully and all CSV outputs were produced.
+
+\section*{9.\ \ Conclusion (what the dataset teaches)}
+
+Your results demonstrate a classic lesson in wireless networking:
+as the number of contenders increases, \emph{performance is not only about capacity, but about contention dynamics and fairness}. UDP can deliver high aggregate goodput at moderate $N$ but can become unfair and less efficient under heavy contention. TCP tends to keep fairness high and aggregate throughput stable by adapting to congestion, at the cost of not reaching the highest UDP peak.
+
+When reporting these experiments, always present fairness and per-STA distributions alongside aggregate throughput; otherwise, you risk missing the most important part of the story: \emph{who benefits and who suffers as load increases}.
+
+\end{document}
