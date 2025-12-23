@@ -1,0 +1,49 @@
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
++0.038107000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.084361000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.140507000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.186761000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.242907000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.289161000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.345307000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.391561000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.447707000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.493961000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.550107000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.596361000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.652507000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.698761000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.754907000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.801161000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.857307000s Generating beacon from 00:00:00:00:00:02 linkID 0
++0.903561000s Generating beacon from 00:00:00:00:00:01 linkID 0
++0.959707000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.005961000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.062107000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.108361000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.164507000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.210761000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.266907000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.313161000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.369307000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.415561000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.471707000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.517961000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.574107000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.620361000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.676507000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.722761000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.778907000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.825161000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.881307000s Generating beacon from 00:00:00:00:00:02 linkID 0
++1.927561000s Generating beacon from 00:00:00:00:00:01 linkID 0
++1.983707000s Generating beacon from 00:00:00:00:00:02 linkID 0
++2.029961000s Generating beacon from 00:00:00:00:00:01 linkID 0
++2.086107000s Generating beacon from 00:00:00:00:00:02 linkID 0
++2.132361000s Generating beacon from 00:00:00:00:00:01 linkID 0
++2.188507000s Generating beacon from 00:00:00:00:00:02 linkID 0
++2.234761000s Generating beacon from 00:00:00:00:00:01 linkID 0
+Process was interrupted by the user

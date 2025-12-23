@@ -1,0 +1,15 @@
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+msg="Invalid attribute set (Verbose) on ns3::Ping", +0.000000000s -1 file=/home/lord/ns-3/src/core/model/object-factory.cc, line=60
+NS_FATAL, terminating
+   0# ns3::ObjectFactory::DoSet(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, ns3::AttributeValue const&) at /home/lord/ns-3/src/core/model/object-factory.cc:60
+   1# main at /home/lord/ns-3/scratch/p6_roaming_multi_ap.cc:668
+   2# __libc_start_call_main at ../sysdeps/nptl/libc_start_call_main.h:58
+   3# __libc_start_main_impl at ../csu/libc-start.c:360
+   4# _start at :0
+   5# 
+
+terminate called without an active exception
+Command 'build/scratch/ns3-dev-p6_roaming_multi_ap-default --simTime=30 --appStart=2 --moveStart=5 --apDistance=30 --staSpeed=2.0 --udpRate=20Mbps --pktSize=1200 --interval=0.5 --ssid=wifi6-ter --outDir=/home/lord/wifi-ter-sim/results/p6 --pcap=false --flowmon=true --seed=1 --run=3' died with <Signals.SIGABRT: 6>.

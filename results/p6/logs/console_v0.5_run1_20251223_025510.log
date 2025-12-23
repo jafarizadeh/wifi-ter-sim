@@ -1,0 +1,24 @@
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+msg="beacon interval should be multiple of 1024us (802.11 time unit), see IEEE Std. 802.11-2012", +0.000000000s -1 file=/home/lord/ns-3/src/wifi/model/ap-wifi-mac.cc, line=410
+NS_FATAL, terminating
+   0# ns3::ApWifiMac::SetBeaconInterval(ns3::Time) at /home/lord/ns-3/src/wifi/model/ap-wifi-mac.cc:410
+   1# ns3::DoMakeAccessorHelperTwo<ns3::TimeValue, ns3::ApWifiMac, ns3::Time, ns3::Time>(void (ns3::ApWifiMac::*)(ns3::Time), ns3::Time (ns3::ApWifiMac::*)() const)::MemberMethod::DoSet(ns3::ApWifiMac*, ns3::TimeValue const*) const at /home/lord/ns-3/src/core/model/attribute-accessor-helper.h:461
+   2# ns3::ObjectBase::DoSet(ns3::Ptr<ns3::AttributeAccessor const>, ns3::Ptr<ns3::AttributeChecker const>, ns3::AttributeValue const&) at /home/lord/ns-3/src/core/model/object-base.cc:206
+   3# ns3::ObjectBase::ConstructSelf(ns3::AttributeConstructionList const&) at /home/lord/ns-3/src/core/model/object-base.cc:158
+   4# ns3::ObjectFactory::Create() const at /home/lord/ns-3/src/core/model/object-factory.cc:91
+   5# ns3::Ptr<ns3::WifiMac> ns3::ObjectFactory::Create<ns3::WifiMac>() const at /home/lord/ns-3/src/core/model/object-factory.h:198
+   6# ns3::WifiMacHelper::Create(ns3::Ptr<ns3::WifiNetDevice>, ns3::WifiStandard) const at /home/lord/ns-3/src/wifi/helper/wifi-mac-helper.cc:101
+   7# ns3::WifiHelper::Install(ns3::WifiPhyHelper const&, ns3::WifiMacHelper const&, __gnu_cxx::__normal_iterator<ns3::Ptr<ns3::Node> const*, std::vector<ns3::Ptr<ns3::Node>, std::allocator<ns3::Ptr<ns3::Node> > > >, __gnu_cxx::__normal_iterator<ns3::Ptr<ns3::Node> const*, std::vector<ns3::Ptr<ns3::Node>, std::allocator<ns3::Ptr<ns3::Node> > > >) const at /home/lord/ns-3/src/wifi/helper/wifi-helper.cc:1140
+   8# ns3::WifiHelper::Install(ns3::WifiPhyHelper const&, ns3::WifiMacHelper const&, ns3::NodeContainer) const at /home/lord/ns-3/src/wifi/helper/wifi-helper.cc:1186
+   9# ns3::WifiHelper::Install(ns3::WifiPhyHelper const&, ns3::WifiMacHelper const&, ns3::Ptr<ns3::Node>) const at /home/lord/ns-3/src/wifi/helper/wifi-helper.cc:1192
+  10# main at /home/lord/ns-3/scratch/p6_roaming_multi_ap.cc:829
+  11# __libc_start_call_main at ../sysdeps/nptl/libc_start_call_main.h:58
+  12# __libc_start_main_impl at ../csu/libc-start.c:360
+  13# _start at :0
+  14# 
+
+terminate called without an active exception
+Command 'build/scratch/ns3-dev-p6_roaming_multi_ap-default --simTime=30 --appStart=2 --moveStart=5 --apDistance=30 --staSpeed=0.5 --udpRate=20Mbps --pktSize=1200 --interval=0.5 --ssid=wifi6-ter --outDir=/home/lord/wifi-ter-sim/results/p6 --pcap=false --flowmon=true --seed=1 --run=1' died with <Signals.SIGABRT: 6>.

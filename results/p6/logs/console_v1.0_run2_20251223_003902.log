@@ -1,0 +1,49 @@
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+Invalid command-line argument: --moveStart=5
+ [Program Options] [General Arguments]
+
+Program Options:
+    --scenario:        baseline | qos | heatmap [qos]
+    --outDir:          Output directory (e.g., results/p8) [results/p8]
+    --ssid:            Wi-Fi SSID [wifi6-ter]
+    --pcap:            Enable PCAP [false]
+    --flowmon:         Export FlowMonitor XML (also used for validation) [true]
+    --seed:            RNG seed [1]
+    --run:             RNG run [1]
+    --txPowerDbm:      Wi-Fi Tx power (dBm) [16]
+    --logExp:          LogDistance exponent [3]
+    --transport:       udp | tcp (baseline) [udp]
+    --simTime:         Simulation time (baseline) [20]
+    --appStart:        Traffic start time (baseline) [2]
+    --distance:        AP-STA distance (baseline) [5]
+    --pktSize:         Packet size bytes (baseline) [1200]
+    --udpRate:         UDP offered rate (baseline) [50Mbps]
+    --tcpMaxBytes:     TCP MaxBytes (baseline) [0]
+    --qosMode:         off | on (qos scenario) [off]
+    --voipPktSize:     VoIP packet size (bytes) [200]
+    --voipIntervalMs:  VoIP packet interval (ms) [20]
+    --videoPktSize:    Video packet size (bytes) [1200]
+    --videoRate:       Video offered rate (e.g., 20Mbps) [20Mbps]
+    --bePktSize:       BestEffort packet size (bytes) [1200]
+    --beRate:          BestEffort offered rate (e.g., 40Mbps) [40Mbps]
+    --heatmapMode:     batch | single (heatmap) [batch]
+    --heatSimTime:     Heatmap simTime (default 12) [12]
+    --heatAppStart:    Heatmap appStart (default 2) [2]
+    --heatPktSize:     Heatmap UDP packet size [1200]
+    --heatUdpRate:     Heatmap UDP offered rate [50Mbps]
+    --x:               Heatmap single point x [0]
+    --y:               Heatmap single point y [0]
+
+General Arguments:
+    --PrintGlobals:              Print the list of globals.
+    --PrintGroups:               Print the list of groups.
+    --PrintGroup=[group]:        Print all TypeIds of group.
+    --PrintTypeIds:              Print all TypeIds.
+    --PrintAttributes=[typeid]:  Print all attributes of typeid.
+    --PrintVersion:              Print the ns-3 version.
+    --PrintHelp:                 Print this help message.
+
+Command 'build/scratch/ns3-dev-p6_roaming_multi_ap-default --simTime=30 --appStart=2 --moveStart=5 --apDistance=30 --staSpeed=1.0 --udpRate=20Mbps --pktSize=1200 --interval=0.5 --ssid=wifi6-ter --outDir=/home/lord/wifi-ter-sim/results/p6 --pcap=false --flowmon=true --seed=1 --run=2 --roamPoll=0.05' returned non-zero exit status 1.

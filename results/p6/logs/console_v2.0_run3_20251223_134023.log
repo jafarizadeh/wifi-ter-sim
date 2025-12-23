@@ -1,0 +1,7 @@
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[0/2] Re-checking globbed directories...
+ninja: no work to do.
+[P6] Trigger roam: StartScanning() linkId=0 channelList.size=1
+[P6] Roam happened: BSSID 00:00:00:00:00:01 -> 00:00:00:00:00:02 at t=15.1s
+[P6] run=3 speed=2 goodput(Mbps)=19.8741 roamTime(s)=15.1 rttMean(ms)=1.53863 samples=65
