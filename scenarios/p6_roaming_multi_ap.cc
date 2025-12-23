@@ -1,5 +1,5 @@
 // scratch/p6_roaming_multi_ap.cc
-// Projet 6: Multi-AP roaming under traffic (Wi-Fi + CSMA), realistic channel, reproducible outputs.
+// Part 6: Multi-AP roaming under traffic (Wi-Fi + CSMA), realistic channel, reproducible outputs.
 
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
@@ -692,7 +692,7 @@ private:
         const std::size_t need = static_cast<std::size_t>(m_linkId) + 1u;
         if (sp.channelList.size() < need)
         {
-            sp.channelList.resize(need); 
+            sp.channelList.resize(need);
         }
 
         NS_LOG_UNCOND("[P6] Trigger roam: StartScanning()"
@@ -921,6 +921,7 @@ int main(int argc, char *argv[])
     cmd.AddValue("roamMinGap", "Min gap between roams (s)", roamMinGapS);
 
     cmd.Parse(argc, argv);
+
     LogComponentDisable("StaWifiMac", LOG_LEVEL_ALL);
     LogComponentDisable("WifiAssocManager", LOG_LEVEL_ALL);
     LogComponentDisable("WifiDefaultAssocManager", LOG_LEVEL_ALL);
@@ -933,11 +934,13 @@ int main(int argc, char *argv[])
         }
     };
 
+    // ---- safer MAC/scan timers (keep your choices) ----
     SetDefaultSafe("ns3::StaWifiMac::AssocRequestTimeout", TimeValue(Seconds(0.5)));
     SetDefaultSafe("ns3::StaWifiMac::ProbeRequestTimeout", TimeValue(MilliSeconds(100)));
     SetDefaultSafe("ns3::StaWifiMac::WaitBeaconTimeout", TimeValue(MilliSeconds(200)));
     SetDefaultSafe("ns3::StaWifiMac::MaxMissedBeacons", UintegerValue(5));
 
+    // ---- validate ----
     if (simTime <= 0.0 || appStart < 0.0 || appStart >= simTime || moveStart < 0.0 || moveStart >= simTime)
     {
         std::cerr << "ERROR: invalid simTime/appStart/moveStart\n";
@@ -954,29 +957,49 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // ---- bestRoam implies not-too-fast polling (avoid log spam) ----
+    if (bestRoam)
+    {
+        roamPollS = std::max(roamPollS, 0.2); // 200ms minimum
+    }
+
+    // ---- RNG ----
     RngSeedManager::SetSeed(static_cast<uint32_t>(seed));
     RngSeedManager::SetRun(static_cast<uint64_t>(run));
 
+    // ---- output dirs ----
     MakeDirs(outDir);
 
     std::ostringstream tag;
     tag << "run" << run;
 
     const std::string roamPath = outDir + "/raw/roaming_events.txt";
-    const std::string thrPath = outDir + "/raw/throughput_timeseries.csv";
-    const std::string sumPath = outDir + "/raw/p6_summary.csv";
+    const std::string thrPath  = outDir + "/raw/throughput_timeseries.csv";
+    const std::string sumPath  = outDir + "/raw/p6_summary.csv";
 
     const std::string roamRunPath = outDir + "/raw/roaming_events_" + tag.str() + ".txt";
-    const std::string thrRunPath = outDir + "/raw/throughput_timeseries_" + tag.str() + ".csv";
-    const std::string posRunPath = outDir + "/raw/sta_pos_" + tag.str() + ".csv";
-    const std::string rttRunPath = outDir + "/raw/rtt_probe_" + tag.str() + ".csv";
+    const std::string thrRunPath  = outDir + "/raw/throughput_timeseries_" + tag.str() + ".csv";
+    const std::string posRunPath  = outDir + "/raw/sta_pos_" + tag.str() + ".csv";
+    const std::string rttRunPath  = outDir + "/raw/rtt_probe_" + tag.str() + ".csv";
     const std::string pingTxtPath = outDir + "/logs/ping.txt";
 
+    // ---- IMPORTANT FIX: reset global files (avoid mixing runs) ----
+    {
+        std::ofstream f(roamPath, std::ios::out | std::ios::trunc);
+        f << "time_s,event,bssid\n";
+    }
+    {
+        std::ofstream f(thrPath, std::ios::out | std::ios::trunc);
+        f << "time_s,throughput_bps\n";
+    }
+
+    // ---- nodes ----
     Ptr<Node> staNode = CreateObject<Node>();
     Ptr<Node> ap1Node = CreateObject<Node>();
     Ptr<Node> ap2Node = CreateObject<Node>();
     Ptr<Node> serverNode = CreateObject<Node>();
 
+    // ---- mobility ----
     MobilityHelper fixed;
     fixed.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     fixed.Install(NodeContainer(ap1Node, ap2Node, serverNode));
@@ -1001,6 +1024,7 @@ int main(int argc, char *argv[])
 
     Ptr<MobilityModel> staMobModel = staNode->GetObject<MobilityModel>();
 
+    // ---- propagation ----
     Ptr<LogDistancePropagationLossModel> logd = CreateObject<LogDistancePropagationLossModel>();
     logd->SetAttribute("Exponent", DoubleValue(logExp));
     logd->SetAttribute("ReferenceDistance", DoubleValue(1.0));
@@ -1029,6 +1053,7 @@ int main(int argc, char *argv[])
     ychan->SetPropagationDelayModel(CreateObject<ConstantSpeedPropagationDelayModel>());
     ychan->SetPropagationLossModel(logd);
 
+    // ---- PHYs ----
     YansWifiPhyHelper phySta;
     phySta.SetChannel(ychan);
     phySta.Set("TxPowerStart", DoubleValue(txPowerStaDbm));
@@ -1050,6 +1075,7 @@ int main(int argc, char *argv[])
     phyAp2.Set("TxPowerLevels", UintegerValue(1));
     phyAp2.Set("RxNoiseFigure", DoubleValue(noiseFigureDb));
 
+    // ---- Wi-Fi helper ----
     WifiHelper wifi;
     const std::string w = ToLower(wifiStd);
     if (w == "ax")
@@ -1097,7 +1123,9 @@ int main(int argc, char *argv[])
 
     if (staMac)
     {
-        staMac->SetAttribute("ActiveProbing", BooleanValue(true));
+        // keep consistent with CLI:
+        staMac->SetAttribute("ActiveProbing", BooleanValue(activeProbing));
+
         Ptr<WifiDefaultAssocManager> am = CreateObject<WifiDefaultAssocManager>();
         am->SetStaWifiMac(staMac);
         staMac->SetAssocManager(am);
@@ -1112,7 +1140,6 @@ int main(int argc, char *argv[])
     Mac48Address staAddr = Mac48Address::ConvertFrom(staDev.Get(0)->GetAddress());
 
     Ptr<BestApRoamer> roamer;
-
     if (bestRoam && staMacBase && ap1Mac && ap2Mac)
     {
         roamer = CreateObject<BestApRoamer>();
@@ -1136,9 +1163,13 @@ int main(int argc, char *argv[])
                       roamMinGapS);
 
         roamer->SetAssocManager(assocMgr);
-        roamer->StartAt(std::max(1.0, moveStart + 0.1));
+
+        // ---- FIX: never start roaming before movement + traffic is stable ----
+        const double roamStart = std::max(appStart, moveStart) + 0.2;
+        roamer->StartAt(std::max(1.0, roamStart));
     }
 
+    // ---- CSMA backbone ----
     CsmaHelper csma;
     csma.SetChannelAttribute("DataRate", StringValue("1Gbps"));
     csma.SetChannelAttribute("Delay", TimeValue(MicroSeconds(50)));
@@ -1149,6 +1180,7 @@ int main(int argc, char *argv[])
     csmaNodes.Add(serverNode);
     NetDeviceContainer csmaDevs = csma.Install(csmaNodes);
 
+    // ---- IP stack ----
     InternetStackHelper internet;
     internet.Install(NodeContainer(staNode, ap1Node, ap2Node, serverNode));
 
@@ -1171,9 +1203,11 @@ int main(int argc, char *argv[])
 
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
+    // ---- apps: UDP traffic ----
     const uint16_t port = 5000;
 
-    PacketSinkHelper sinkHelper("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), port));
+    PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
+                                InetSocketAddress(Ipv4Address::GetAny(), port));
     ApplicationContainer sinkApp = sinkHelper.Install(serverNode);
     sinkApp.Start(Seconds(0.0));
     sinkApp.Stop(Seconds(simTime));
@@ -1188,6 +1222,7 @@ int main(int argc, char *argv[])
     clientApp.Start(Seconds(appStart));
     clientApp.Stop(Seconds(simTime));
 
+    // ---- RTT probe ----
     Ptr<RttEchoServer> rttSrv;
     Ptr<RttCsvProbe> rttCli;
     if (enableRttProbe)
@@ -1205,6 +1240,7 @@ int main(int argc, char *argv[])
         rttCli->SetStopTime(Seconds(simTime));
     }
 
+    // ---- routing controller ----
     Ptr<RoamRoutingController> rc = CreateObject<RoamRoutingController>();
     rc->Setup(staNode,
               serverNode,
@@ -1220,9 +1256,12 @@ int main(int argc, char *argv[])
               ap1Bssid,
               ap2Bssid);
 
-    const double roamLogStart = 1.0;
+    // ---- loggers ----
+    // FIX: start logging after association stabilizes and after movement begins
+    const double roamLogStart = std::max(appStart, moveStart) + 0.5;
+
     RoamingLogger roamGlobal;
-    roamGlobal.Init(staMacBase, static_cast<uint8_t>(linkId), roamPath, roamPollS, true);
+    roamGlobal.Init(staMacBase, static_cast<uint8_t>(linkId), roamPath, roamPollS, false); // append=false
     roamGlobal.SetRoutingController(rc);
     roamGlobal.StartAt(roamLogStart);
 
@@ -1232,9 +1271,10 @@ int main(int argc, char *argv[])
     roamRun.StartAt(roamLogStart);
 
     ThroughputSampler thrGlobal;
-    thrGlobal.Init(sink, thrPath, interval, true);
+    thrGlobal.Init(sink, thrPath, interval, false); // append=false (global is already truncated)
     ThroughputSampler thrRun;
     thrRun.Init(sink, thrRunPath, interval, false);
+
     thrGlobal.StartAt(std::max(appStart, 0.001));
     thrRun.StartAt(std::max(appStart, 0.001));
 
@@ -1242,6 +1282,7 @@ int main(int argc, char *argv[])
     pos.Init(staMobModel, posRunPath, posPollS);
     pos.StartAt(0.001);
 
+    // ---- PCAP ----
     if (pcap)
     {
         std::ostringstream pfx;
@@ -1252,20 +1293,24 @@ int main(int argc, char *argv[])
         csma.EnablePcap(pfx.str() + "_csma", csmaDevs.Get(0), true);
     }
 
+    // ---- FlowMonitor ----
     FlowMonitorHelper fmHelper;
     Ptr<FlowMonitor> monitor;
     if (flowmon)
         monitor = fmHelper.InstallAll();
 
+    // ---- run ----
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
 
+    // ---- stop loggers ----
     thrGlobal.Stop();
     thrRun.Stop();
     pos.Stop();
     roamGlobal.Stop();
     roamRun.Stop();
 
+    // ---- flowmon output ----
     if (flowmon && monitor)
     {
         monitor->CheckForLostPackets();
@@ -1274,9 +1319,12 @@ int main(int argc, char *argv[])
         monitor->SerializeToXmlFile(fmp.str(), true, true);
     }
 
+    // ---- compute summary ----
     const uint64_t rxBytes = sink ? sink->GetTotalRx() : 0;
     const double useful = simTime - appStart;
     const double goodputBps = (useful > 0.0) ? (8.0 * static_cast<double>(rxBytes) / useful) : 0.0;
+
+    // pick first real roam time from per-run file
     const double roamTime = roamRun.GetFirstRoamTime();
 
     double rttMeanMs = 0.0;
@@ -1318,7 +1366,7 @@ int main(int argc, char *argv[])
         if (rttSamples > 0)
             rttMeanMs = rttSum / static_cast<double>(rttSamples);
 
-        // ping.txt
+        // generate ping-like txt
         {
             std::ifstream in2(rttRunPath);
             std::ofstream out(pingTxtPath, std::ios::out | std::ios::trunc);
@@ -1345,6 +1393,7 @@ int main(int argc, char *argv[])
         }
     }
 
+    // ---- summary CSV ----
     const bool needHeader = !IsFileNonEmpty(sumPath);
     std::ofstream sumFile(sumPath, std::ios::out | std::ios::app);
     if (needHeader)

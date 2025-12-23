@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/run_p6.sh
-# Projet 6 — Multi-AP roaming experiments (speeds sweep)
+# Part 6 — Multi-AP roaming experiments (speeds sweep)
 
 set -u
 set -o pipefail
