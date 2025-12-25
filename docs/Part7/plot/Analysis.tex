@@ -1,0 +1,408 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{hyperref}
+
+\begin{document}
+
+\begin{center}
+\LARGE \textbf{Channel Plannabout:blank\#blockeding in a Two-Cell Wi-Fi Scenario: A Detailed Throughput and Fairness Analysis}
+\end{center}
+
+\section*{1. Introduction (Why this experiment matters)}
+
+In dense Wi-Fi deployments (campuses, apartment buildings, offices), multiple access points often operate close enough that their transmissions overlap in space. When two neighboring cells use the \textbf{same RF channel}, they are not isolated systems anymore: they become one larger contention domain, meaning that devices in both cells compete for the same airtime. This can reduce the useful throughput delivered to applications (goodput) and can also introduce unfairness—one cell may “win” more airtime than the other for long periods due to random backoff and collision dynamics.
+
+Channel planning is the simplest engineering remedy: choose different channels so that neighboring cells do not interfere. In simulation, this idea can be modeled in two ways:
+
+\begin{enumerate}
+\item \textbf{Co-channel operation}: both cells share the same contention/interference environment.
+\item \textbf{Separate-channel operation}: cells are placed on distinct channels (idealized orthogonality), so inter-cell interference is removed.
+\end{enumerate}
+
+This report analyzes how those two modes behave as the number of stations per cell increases (\( (n \in \{2, 5, 10\}) \)). We use \textbf{goodput} as the performance metric and \textbf{Jain’s fairness index} as the fairness metric between the two cells. In addition, we analyze the \textbf{distribution of per-station goodput} at \( (n=10) \), because averages alone can hide starvation-like behavior.
+
+\noindent\rule{\linewidth}{0.4pt}
+
+\section*{2. Metrics and Statistical Quantities (Educational definitions)}
+
+\subsection*{2.1 Goodput (what it measures and what it excludes)}
+
+Goodput is the rate of \textbf{useful application payload successfully delivered} to the receiver. It differs from PHY rate and MAC throughput because it does \textbf{not} count retransmissions, headers, idle backoff time, or collided frames as “useful.” That is exactly why it is the best metric when your goal is “what the user actually gets.”
+
+Goodput is computed as:
+\[
+G = \frac{8 , B_{\text{rx}}}{T_{\text{eff}}}
+\]
+where \( B_{\text{rx}} \) is received payload bytes and \( T_{\text{eff}} \) is the effective measurement interval (the time during which the application is actively sending). Reporting goodput in Mbps makes comparisons easy.
+
+\subsection*{2.2 Total goodput and per-cell goodput}
+
+Because we have two cells, we can talk about:
+
+\begin{itemize}
+\item \( G_1 \): goodput delivered in Cell 1
+\item \( G_2 \): goodput delivered in Cell 2
+\item Total:
+\[
+G_T = G_1 + G_2
+\]
+\end{itemize}
+Total goodput is the most direct measure of “network capacity” in this two-cell setting.
+
+\subsection*{2.3 Fairness between cells: Jain’s index}
+
+A system can have high total throughput but still be unfair. To quantify balance between cells we use Jain’s fairness index:
+\[
+J = \frac{(G_1 + G_2)^2}{2(G_1^2 + G_2^2)}
+\]
+For two cells:
+
+\begin{itemize}
+\item \( J = 1 \) means perfect equality (\( G_1 = G_2 \))
+\item Lower \( J \) means imbalance (one cell dominates)
+\end{itemize}
+
+To make fairness interpretable, we also compute an \textbf{imbalance ratio}:
+\[
+R = \frac{\max(G_1,G_2)}{\min(G_1,G_2)}
+\]
+If \( R = 1 \), the cells are perfectly balanced; if \( R = 1.4 \), one cell gets 40\% more throughput than the other.
+
+\noindent\rule{\linewidth}{0.4pt}
+
+\section*{3. Measured Results (Exact numbers used by all figures)}
+
+\textbf{Table 1 — Per-cell goodput, total goodput, and cell-level fairness (exact values)}
+
+\begin{center}
+\begin{tabular}{lrrrrr}
+\toprule
+Channel plan     & \multicolumn{1}{c}{(n) (STAs/cell)} & \multicolumn{1}{c}{\( G_1 \) (Mbps)} & \multicolumn{1}{c}{\( G_2 \) (Mbps)} & \multicolumn{1}{c}{\( G_T \) (Mbps)} & \multicolumn{1}{c}{Jain (J)} \\
+\midrule
+Co-channel       & 2  & 19.932 & 19.922 & 39.854 & 1.0000 \\
+Co-channel       & 5  & 42.010 & 38.886 & 80.896 & 0.9985 \\
+Co-channel       & 10 & 35.098 & 25.152 & 60.250 & 0.9735 \\
+Separate-channel & 2  & 19.964 & 19.957 & 39.921 & 1.0000 \\
+Separate-channel & 5  & 49.658 & 49.682 & 99.340 & 1.0000 \\
+Separate-channel & 10 & 52.345 & 52.361 & 104.707 & 1.0000 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These values will now be interpreted figure-by-figure, and the narrative will explain \textit{why} the plots look the way they do.
+
+\noindent\rule{\linewidth}{0.4pt}
+
+\section*{4. Figure-by-Figure Deep Analysis (Educational, plot-driven)}
+
+\subsection*{4.1 Per-cell goodput trends and what their shapes mean}
+
+[Figure: P7 Per-Cell Goodput vs nStaPerCell]
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{goodput_cells_vs_n.png}
+\caption{Figure: P7 Per-Cell Goodput vs nStaPerCell}
+\end{figure}
+
+This plot is the “microscope” view: instead of only seeing total capacity, we see \textbf{how each cell individually behaves} as the network becomes denser. The x-axis increases the number of stations per cell from 2 to 10. The y-axis shows the goodput achieved in Mbps. There are four curves: Cell 1 and Cell 2 under co-channel, and Cell 1 and Cell 2 under separate-channel.
+
+Start at \( n=2 \). All four series begin around \textbf{20 Mbps per cell}, which means the system is not yet dominated by contention. With only two stations per cell, the medium is not heavily overloaded; collisions and backoff overhead are relatively modest. Most importantly, the \textbf{co-channel} and \textbf{separate-channel} modes look nearly identical. That is expected: if the offered load is low enough, removing interference does not create much extra capacity because the channel was not saturated in the first place.
+
+Now look at \( n=5 \). Here the two channel plans diverge in a very meaningful way. Under \textbf{separate-channel}, both cells rise to about \textbf{49.7 Mbps} and remain nearly equal to each other. That near-perfect symmetry tells us: when cells are isolated, each cell behaves like a stable single-cell Wi-Fi network. Under \textbf{co-channel}, performance still increases compared to \( n=2 \), but the cells do not rise as far: Cell 1 reaches about \textbf{42.0 Mbps} while Cell 2 reaches about \textbf{38.9 Mbps}. This is already evidence of an important effect: co-channel does not simply reduce the total throughput; it also begins to introduce \textbf{cell-to-cell imbalance}. The reason is that once the contention domain becomes larger (stations from both cells competing), the random outcomes of CSMA/CA (backoff counters, collisions, retransmissions) can produce \textbf{airtime capture} where one group effectively wins more transmission opportunities.
+
+The most interesting behavior occurs at \( n=10 \). Under \textbf{separate-channel}, both cells increase slightly again to about \textbf{52.35 Mbps}, remaining extremely close. This is the signature of a system that is still “healthy”: it may be approaching a plateau, but it does not collapse. Under \textbf{co-channel}, the behavior changes dramatically: Cell 1 drops from \textasciitilde42 Mbps to \textbf{\textasciitilde35 Mbps}, and Cell 2 drops even more strongly to \textbf{\textasciitilde25 Mbps}. This tells us two things simultaneously:
+
+\begin{enumerate}
+\item \textbf{Co-channel becomes oversaturated at high density.} More stations do not translate into more useful delivered payload, because contention overhead grows faster than useful airtime.
+\item \textbf{One cell suffers disproportionately.} The gap between 35 Mbps and 25 Mbps is not small; it is a structural imbalance that will later be reflected in the fairness metric.
+\end{enumerate}
+
+This single plot already supports the core engineering conclusion: channel separation not only improves throughput, it preserves predictable behavior and cell symmetry as density increases.
+
+\subsection*{4.2 Total goodput: capacity scaling and the “collapse” phenomenon}
+
+[Figure: P7 Total Goodput vs nStaPerCell]
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{goodput_total_vs_n.png}
+\caption{Figure: P7 Total Goodput vs nStaPerCell}
+\end{figure}
+
+Total goodput is the sum of both cells’ goodputs, so it measures system-level capacity. Interpreting this plot is like asking: “If a network operator only cares about total delivered user data, how much capacity does each channel plan provide as we add more users?”
+
+At \( n=2 \), both plans deliver almost the same total goodput: \textbf{39.854 Mbps} (co-channel) vs \textbf{39.921 Mbps} (separate-channel). The difference is only \textbf{0.0668 Mbps}, which is practically negligible. This is a crucial teaching point: channel planning is not always important; its value depends on load. Under light contention, the medium is not the bottleneck, so isolating cells brings little benefit.
+
+At \( n=5 \), the situation changes. Co-channel total goodput rises to \textbf{80.896 Mbps}, while separate-channel rises to \textbf{99.340 Mbps}. The absolute gain is:
+\[
+\Delta G_T(5)=99.340-80.896=18.4445\ \text{Mbps}
+\]
+and the relative gain is:
+\[
+\%\text{Gain}(5)=\frac{18.4445}{80.896}\times 100 = 22.8003\%
+\]
+A 22.8\% improvement from channel planning at medium density is already a strong result. It means the co-channel network is beginning to lose a substantial fraction of airtime to contention and collisions between the two cells.
+
+At \( n=10 \), the plot shows the most important phenomenon in the entire experiment: \textbf{co-channel throughput collapse}. Co-channel total goodput falls from \textbf{\textasciitilde80.9 Mbps} down to \textbf{\textasciitilde60.25 Mbps}, even though we added more stations. Meanwhile separate-channel increases slightly to \textbf{\textasciitilde104.7 Mbps}. The gain becomes:
+\[
+\Delta G_T(10)=104.707-60.250=44.4568\ \text{Mbps}
+\]
+and the relative improvement is:
+\[
+\%\text{Gain}(10)=\frac{44.4568}{60.250}\times 100 = 73.7871\%
+\]
+This \textasciitilde74\% improvement is enormous and conveys a key lesson: in dense Wi-Fi, \textbf{co-channel interference can reduce total delivered payload far below what two isolated cells could achieve}. The reason is not mysterious: as the number of contenders grows, CSMA/CA spends more time in backoff, collisions increase, and retransmissions waste airtime. Eventually, the marginal benefit of adding more senders becomes negative: more users create more overhead than useful additional throughput, hence the total goodput declines.
+
+\subsection*{4.3 Fairness: why Jain’s index drops only in co-channel at high density}
+
+[Figure: P7 Jain Fairness vs nStaPerCell]
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{jain_vs_n.png}
+\caption{Figure: P7 Jain Fairness vs nStaPerCell}
+\end{figure}
+
+This plot is often misunderstood unless you connect it directly to the per-cell values. Let’s do that carefully.
+
+Under separate-channel, Jain’s index remains essentially \textbf{1.0} for all station densities. This is because the two cells deliver almost identical goodput:
+
+\begin{itemize}
+\item \( n=10 \): \( G_1=52.345 \) and \( G_2=52.361 \) Mbps, a difference of only \textbf{0.0159 Mbps}.
+\end{itemize}
+When \( G_1 \approx G_2 \), Jain’s index is mathematically forced to be near 1.
+
+Under co-channel, Jain’s index is:
+
+\begin{itemize}
+\item (1.0000) at \( n=2 \) (cells are equal)
+\item (0.9985) at \( n=5 \) (small imbalance)
+\item \textbf{0.9735} at \( n=10 \) (significant imbalance)
+\end{itemize}
+
+To make this educational, we can verify the \( n=10 \) fairness value directly from the formula:
+
+For co-channel at \( n=10 \),
+\[
+G_1=35.098,\quad G_2=25.152
+\]
+Compute:
+\[
+(G_1+G_2)^2 = (60.250)^2
+\]
+\[
+G_1^2 + G_2^2 = (35.098)^2 + (25.152)^2
+\]
+Then:
+\[
+J = \frac{(60.250)^2}{2\left((35.098)^2 + (25.152)^2\right)} \approx 0.973
+\]
+which matches the plotted value. The fairness decline is therefore not an artifact; it is a mathematically consistent reflection of the throughput imbalance.
+
+The engineering lesson is clear: when two cells share airtime, random MAC effects do not only reduce throughput but can also create \textbf{persistent asymmetry}, where one cell becomes the “loser” and achieves substantially lower goodput. That effect becomes visible only when the network is heavily loaded, because under light load there is enough airtime for both cells to appear equal.
+
+\subsection*{4.4 Station-level bar plot: the most intuitive evidence of variability}
+
+[Figure: P7 Per-STA Goodput (Bar) for nStaPerCell=10]
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{per_sta_bars_n10.png}
+\caption{Figure: P7 Per-STA Goodput (Bar) for nStaPerCell=10}
+\end{figure}
+
+The bar plot at \( n=10 \) answers a question that totals cannot: “Do all users suffer equally, or do some users suffer much more than others?”
+
+In separate-channel mode, the bars are tightly clustered around roughly \textbf{5 to 5.6 Mbps}. That is exactly what you would expect if a cell shares its capacity relatively evenly among 10 active stations. In fact, the \textbf{exact mean per station} in each separate-channel cell at \( n=10 \) is:
+\[
+\bar{g}*{\text{sep,cell1}} = \frac{52.345}{10} = 5.2345\ \text{Mbps}
+\]
+\[
+\bar{g}*{\text{sep,cell2}} = \frac{52.361}{10} = 5.2361\ \text{Mbps}
+\]
+A tight cluster around \textasciitilde5.24 Mbps is therefore consistent with the exact totals.
+
+In co-channel mode, the story is completely different. The bars span a wide range (visibly from roughly \textbf{\textasciitilde1.3 Mbps} up to \textbf{\textasciitilde6.7 Mbps}). This wide spread means that “average throughput” is hiding an important truth: \textbf{some stations are receiving several times more throughput than others}. This is precisely the pattern expected under heavy contention: depending on collisions, backoff luck, and spatial/MAC interactions, some stations manage to transmit more successfully, while others repeatedly defer or collide and end up with much lower delivered payload.
+
+This plot is also consistent with cell-level imbalance. In co-channel at \( n=10 \), Cell 2 has only \textbf{25.152 Mbps}, which means the mean per station in Cell 2 is:
+\[
+\bar{g}*{\text{co,cell2}} = \frac{25.152}{10} = 2.5152\ \text{Mbps}
+\]
+while Cell 1’s mean is:
+\[
+\bar{g}*{\text{co,cell1}} = \frac{35.098}{10} = 3.5098\ \text{Mbps}
+\]
+So, before even looking at the dispersion, we already know Cell 2 stations must be, on average, worse off. The bar plot then reveals that within each cell, station outcomes are also highly heterogeneous in co-channel.
+
+\subsection*{4.5 Box plot by cell: separating “inter-cell unfairness” from “intra-cell dispersion”}
+
+[Figure: P7 Per-STA Goodput Distribution by Cell (Box) for nStaPerCell=10]
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{per_sta_box_by_cell_n10.png}
+\caption{Figure: P7 Per-STA Goodput Distribution by Cell (Box) for nStaPerCell=10}
+\end{figure}
+
+This figure is extremely informative because it separates two fairness concepts:
+
+\begin{enumerate}
+\item \textbf{Fairness between cells} (Cell 1 vs Cell 2)
+\item \textbf{Fairness among stations inside each cell}
+\end{enumerate}
+
+Box plots are designed to show (a) the typical value (median), (b) the middle spread (IQR), and (c) extremes/outliers.
+
+In separate-channel mode, the box for Cell 1 and Cell 2 are both narrow and centered around similar values. That indicates two things: stations inside each cell receive comparable rates (low IQR), and the two cells behave almost identically (matching the Jain index near 1.0).
+
+In co-channel mode, the boxes are visibly wider and shifted downward—especially for the weaker cell. A wider box indicates higher dispersion: some stations perform reasonably well while others perform poorly. The fact that the entire distribution for one cell is lower than the other is the distribution-level view of the same imbalance that Jain captured at the aggregate level. This is the strongest qualitative confirmation that co-channel operation does not merely reduce capacity; it causes \textit{unequal service} both between and within cells when density is high.
+
+\subsection*{4.6 Box plot aggregated: a clean summary of “stability vs instability”}
+
+[Figure: P7 Per-STA Goodput Distribution (Box) for nStaPerCell=10]
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{per_sta_box_n10.png}
+\caption{Figure: P7 Per-STA Goodput Distribution (Box) for nStaPerCell=10}
+\end{figure}
+
+This plot removes the cell distinction and answers a simpler question: “Across all 20 stations, how different are the two channel plans?”
+
+The separate-channel distribution is tight with a high median, while the co-channel distribution is wider with a lower median and visible outliers. This is exactly what you should expect from the totals:
+
+Across both cells at \( n=10 \), the mean per station is:
+\[
+\bar{g}*{\text{co,all}} = \frac{G_T^{co}}{20} = \frac{60.250}{20} = 3.0125\ \text{Mbps}
+\]
+\[
+\bar{g}*{\text{sep,all}} = \frac{G_T^{sep}}{20} = \frac{104.707}{20} = 5.23535\ \text{Mbps}
+\]
+So, separate-channel shifts the entire station population upward by more than \textbf{2.22 Mbps per station on average}, and the box plot visually confirms that this gain comes with reduced variability (more predictable service).
+
+\subsection*{4.7 CDF: the most rigorous way to compare distributions without hiding tails}
+
+[Figure: P7 CDF of Per-STA Goodput for nStaPerCell=10]
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{per_sta_cdf_n10.png}
+\caption{Figure: P7 CDF of Per-STA Goodput for nStaPerCell=10}
+\end{figure}
+
+CDFs are often considered “more scientific” than bar plots because they show the entire distribution without relying on binning or summary statistics. A CDF tells you, for any throughput value (\( x \)), what fraction of stations have throughput (\( \le x \)).
+
+In separate-channel mode, the CDF rises steeply over a narrow x-range. A steep rise means most stations lie close together—i.e., low variance. In co-channel mode, the CDF rises slowly over a wide range; that means the station throughputs are spread out substantially.
+
+The most educational insight comes from reading the CDF as a service guarantee. For example, pick a throughput threshold such as \( x=3 \) Mbps. In co-channel mode, a large fraction of stations appear at or below such low rates. In separate-channel mode, essentially all stations are far above that threshold. This is why distribution plots are essential: the total goodput difference at \( n=10 \) is huge, but the CDF shows that the improvement is not only in the mean—\textbf{it improves the entire distribution}, including the worst-served stations.
+
+\subsection*{4.8 CDF by cell: diagnosing which cell loses and how strongly}
+
+[Figure: P7 CDF of Per-STA Goodput by Cell (nStaPerCell=10)]
+
+\begin{figure}[h!]
+\centering
+\includegraphics[width=\linewidth]{per_sta_ecdf_by_cell_n10.png}
+\caption{Figure: P7 CDF of Per-STA Goodput by Cell (nStaPerCell=10)}
+\end{figure}
+
+This plot is a “diagnostic tool.” If the two separate-channel curves (cell1 and cell2) overlap tightly, that means channel separation equalizes both cells. Your figure indeed shows near-overlap for separate-channel, which matches the tiny difference between \( G_1 \) and \( G_2 \).
+
+In co-channel, the two cell CDFs are clearly separated: one is shifted left, meaning a larger fraction of stations in that cell experience low throughput. This distribution-level separation corresponds directly to the imbalance ratio:
+\[
+R_{co}(10)=\frac{35.098}{25.152}\approx 1.395
+\]
+An imbalance ratio near 1.4 is large enough that it must appear visually in the per-cell CDFs, and it does. The CDF-by-cell plot therefore validates the fairness conclusion with a much richer view than a single Jain number.
+
+\noindent\rule{\linewidth}{0.4pt}
+
+\section*{5. Putting everything together: a coherent explanation (not just “results”)}
+
+All eight figures tell the same story at different resolutions:
+
+At low density (\( n=2 \)), the network is not saturated, so co-channel interference does not meaningfully reduce delivered payload. The per-cell curves are nearly identical, total goodput is nearly equal, and fairness is perfect.
+
+At medium density (\( n=5 \)), the network begins to experience real contention. Separate-channel allows both cells to use airtime independently, pushing each cell close to \textasciitilde50 Mbps and the total near \textasciitilde99 Mbps. Co-channel is still able to grow in throughput, but it begins to lose a substantial fraction of airtime to increased contention and collisions, and small imbalance appears.
+
+At high density (\( n=10 \)), co-channel enters an oversaturated regime: adding more contending stations increases overhead so much that total delivered payload declines. At the same time, fairness worsens: one cell becomes noticeably weaker. Station-level plots show that co-channel creates a wide dispersion, which means some stations are severely disadvantaged. Separate-channel avoids both collapse and dispersion; it maintains high throughput and predictable per-station performance.
+
+From an engineering viewpoint, this is precisely the practical reason channel planning is emphasized in real deployments: under heavy load, co-channel operation causes capacity loss and unequal user experience.
+
+\noindent\rule{\linewidth}{0.4pt}
+
+\section*{6. Exact statistical tables you can include in the report (standalone)}
+
+\textbf{Table 2 — Total goodput improvements (exact)}
+
+\begin{center}
+\begin{tabular}{rrrrr}
+\toprule
+\( n \) & \( G_T^{co} \) & \( G_T^{sep} \) & \( \Delta G_T \) & \% Gain \\
+\midrule
+2  & 39.854 & 39.921 & 0.0668  & 0.1676\% \\
+5  & 80.896 & 99.340 & 18.4445 & 22.8003\% \\
+10 & 60.250 & 104.707 & 44.4568 & 73.7871\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Table 3 — Inter-cell imbalance statistics (exact)}
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+Plan & \( n \) & \( |G_1-G_2| \) & Ratio \( R \) & Jain \( J \) \\
+\midrule
+Co-channel         & 2  & 0.0100 & 1.0005 & 1.0000 \\
+Co-channel         & 5  & 3.1242 & 1.0803 & 0.9985 \\
+Co-channel         & 10 & 9.9460 & 1.3954 & 0.9735 \\
+Separate-channel   & 2  & 0.0075 & 1.0004 & 1.0000 \\
+Separate-channel   & 5  & 0.0238 & 1.0005 & 1.0000 \\
+Separate-channel   & 10 & 0.0159 & 1.0003 & 1.0000 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Table 4 — Exact mean per-STA goodput by cell (derived from per-cell totals)}
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Plan             & \( n \) & Cell 1 mean/STA & Cell 2 mean/STA \\
+\midrule
+Co-channel       & 10 & 3.5098 & 2.5152 \\
+Separate-channel & 10 & 5.2345 & 5.2361 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+(You may include the \( n=2 \) and \( n=5 \) rows too, but \( n=10 \) is where distribution plots exist and the conclusions are strongest.)
+
+\noindent\rule{\linewidth}{0.4pt}
+
+\section*{7. Where to place each plot in your report (explicit placeholders)}
+
+To help you paste cleanly, insert figures exactly at these markers:
+
+\begin{itemize}
+\item \textbf{[Figure: P7 Per-Cell Goodput vs nStaPerCell]} — after Section 4.1
+\item \textbf{[Figure: P7 Total Goodput vs nStaPerCell]} — after Section 4.2
+\item \textbf{[Figure: P7 Jain Fairness vs nStaPerCell]} — after Section 4.3
+\item \textbf{[Figure: P7 Per-STA Goodput (Bar) for nStaPerCell=10]} — after Section 4.4
+\item \textbf{[Figure: P7 Per-STA Goodput Distribution by Cell (Box) for nStaPerCell=10]} — after Section 4.5
+\item \textbf{[Figure: P7 Per-STA Goodput Distribution (Box) for nStaPerCell=10]} — after Section 4.6
+\item \textbf{[Figure: P7 CDF of Per-STA Goodput for nStaPerCell=10]} — after Section 4.7
+\item \textbf{[Figure: P7 CDF of Per-STA Goodput by Cell (nStaPerCell=10)]} — after Section 4.8
+\end{itemize}
+
+\noindent\rule{\linewidth}{0.4pt}
+
+\end{document}
