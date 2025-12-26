@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # scripts/run_p8.sh
 #
-# Projet 8 (ns-3) runner - inspired by run_p7.sh:
-#  1) Cleans previous outputs (default).
-#  2) Stages scenario source into ns-3 scratch/.
-#  3) Builds ns-3 (quiet by default, logs to results/p8/logs/build.log).
-#  4) Runs the required scenarios with counters like: [1/38]
-#       - baseline (1 run)
-#       - qos off + qos on (2 runs)
-#       - heatmap single-point grid (35 runs: 7x5)
-#  5) Verifies that required output files exist.
+# Projet 8 (ns-3.41) runner - aligned with your run_p7 style:
+#  1) Clean outputs (default).
+#  2) Stage scenario source into ns-3 scratch/.
+#  3) Build ns-3 (quiet by default, logs to results/p8/logs/build.log).
+#  4) Run experiments with a progress counter like: [1/13]
+#       - baseline: VO+VI only (1 run, BE disabled)
+#       - congestion: OFF + ON at BE_RATE_DEFAULT (2 runs)
+#       - sweep: BE_RATES x {OFF,ON}  (default: 5x2=10 runs)
+#  5) Verify required outputs exist.
 #
 # Usage:
 #   chmod +x scripts/run_p8.sh
@@ -19,9 +19,8 @@
 #   NS3_DIR=~/ns-3 OUTDIR=results/p8 ./scripts/run_p8.sh
 #   CLEAN=false QUIET_RUN=false ./scripts/run_p8.sh
 #   STOP_ON_FIRST_FAIL=true ./scripts/run_p8.sh
-#   # If you want to stage your fixed file instead:
-#   SCEN_SRC=./scenarios/p8_final_simulator_fixed.cc ./scripts/run_p8.sh
-
+#   SCEN_SRC=./scenarios/p8_qos_wmm.cc ./scripts/run_p8.sh
+#
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -30,54 +29,44 @@ NS3_DIR="${NS3_DIR:-$HOME/ns-3}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Scenario source in your repo + target name in ns-3 scratch/
-SCEN_SRC="${SCEN_SRC:-$ROOT_DIR/scenarios/p8_final_simulator.cc}"
-SCEN_NAME="${SCEN_NAME:-p8_final_simulator}"
+SCEN_SRC="${SCEN_SRC:-$ROOT_DIR/scenarios/p8_qos_wmm.cc}"
+SCEN_NAME="${SCEN_NAME:-p8_qos_wmm}"
 SCENARIO="${SCENARIO:-scratch/${SCEN_NAME}}"
 
-# Output folder (inside your repo)
+# Output folder (inside your repo) — IMPORTANT: project folder name is p8
 OUTDIR="${OUTDIR:-$ROOT_DIR/results/p8}"
 
-# Common knobs (match your C++ CLI options)
-SSID="${SSID:-WIFI-TER-P8}"
+# Common knobs (match the C++ CLI options)
 PCAP="${PCAP:-false}"
 FLOWMON="${FLOWMON:-true}"
 SEED="${SEED:-1}"
 RUN_BASE="${RUN_BASE:-1}"
+DURATION="${DURATION:-30}"
+APPSTART="${APPSTART:-1.0}"
 
+# Wi-Fi knobs (match C++ options)
+STANDARD="${STANDARD:-ax}"        # ax|ac|n
+DATAMODE="${DATAMODE:-HeMcs7}"    # for 11ax
+CTRLMODE="${CTRLMODE:-HeMcs0}"
 TXPWR="${TXPWR:-16}"
-LOGEXP="${LOGEXP:-3.0}"
+CHWIDTH="${CHWIDTH:-20}"
+CHANNELNUM="${CHANNELNUM:-36}"    # if your C++ supports --channelNumber
 
-# Baseline settings
-BASE_TRANSPORT="${BASE_TRANSPORT:-udp}"      # udp|tcp
-BASE_SIMTIME="${BASE_SIMTIME:-25}"
-BASE_APPSTART="${BASE_APPSTART:-2}"
-BASE_DISTANCE="${BASE_DISTANCE:-10}"
-BASE_PKTSIZE="${BASE_PKTSIZE:-1200}"
-BASE_UDPRATE="${BASE_UDPRATE:-10Mbps}"
-BASE_TCPMAXBYTES="${BASE_TCPMAXBYTES:-0}"   # 0 => unlimited in your code (if implemented)
+# Traffic defaults
+VOIP_PKTSIZE="${VOIP_PKTSIZE:-160}"
+VOIP_PPS="${VOIP_PPS:-50}"
 
-# QoS settings
-QOS_SIMTIME="${QOS_SIMTIME:-25}"
-QOS_APPSTART="${QOS_APPSTART:-2}"
-VIDEO_RATE="${VIDEO_RATE:-20Mbps}"
-BE_RATE="${BE_RATE:-40Mbps}"
-VOIP_PKTSIZE="${VOIP_PKTSIZE:-200}"
-VOIP_INTERVAL_MS="${VOIP_INTERVAL_MS:-20}"
 VIDEO_PKTSIZE="${VIDEO_PKTSIZE:-1200}"
+VIDEO_RATE_MBPS="${VIDEO_RATE_MBPS:-6}"
+
 BE_PKTSIZE="${BE_PKTSIZE:-1200}"
+BE_RATE_DEFAULT="${BE_RATE_DEFAULT:-40}"
 
-# Heatmap settings (single point grid; 7x5 = 35)
-HEAT_SIMTIME="${HEAT_SIMTIME:-12}"
-HEAT_APPSTART="${HEAT_APPSTART:-2}"
-HEAT_PKTSIZE="${HEAT_PKTSIZE:-1200}"
-HEAT_UDPRATE="${HEAT_UDPRATE:-10Mbps}"
-
-# Grid points (as specified in project statement)
-X_POINTS=(0 5 10 15 20 25 30)
-Y_POINTS=(0 5 10 15 20)
+# Sweep rates (comma-separated)
+BE_RATES="${BE_RATES:-0,10,20,40,60}"
 
 # Behavior toggles
-CLEAN="${CLEAN:-true}"                      # delete old outputs first
+CLEAN="${CLEAN:-true}"
 STOP_ON_FIRST_FAIL="${STOP_ON_FIRST_FAIL:-false}"
 QUIET_BUILD="${QUIET_BUILD:-true}"
 QUIET_RUN="${QUIET_RUN:-true}"
@@ -92,14 +81,19 @@ die() { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 
 ensure_dirs() {
-  mkdir -p "$OUTDIR/raw" "$OUTDIR/logs" "$OUTDIR/plots" "$OUTDIR/heatmaps"
+  mkdir -p "$OUTDIR/raw" "$OUTDIR/logs" "$OUTDIR/plots" "$OUTDIR/pcap" "$OUTDIR/report"
 }
 
 clean_outputs() {
   log "[P8] Cleaning previous outputs under: $OUTDIR"
-  # Hard clean: remove all files under OUTDIR (but keep directory)
-  rm -rf "$OUTDIR/raw" "$OUTDIR/logs" "$OUTDIR/plots" "$OUTDIR/heatmaps" || true
+  rm -rf "$OUTDIR/raw" "$OUTDIR/logs" "$OUTDIR/plots" "$OUTDIR/pcap" "$OUTDIR/report" || true
   ensure_dirs
+}
+
+init_csv() {
+  local csv="$OUTDIR/raw/p8_summary.csv"
+  echo "mode,beRateMbps,seed,run,goodputBE,goodputVO,goodputVI,delayVO_ms,jitterVO_ms,lossVO,delayVI_ms,jitterVI_ms,lossVI" > "$csv"
+  log "[P8] Initialized CSV: $csv"
 }
 
 stage_scenario() {
@@ -136,6 +130,8 @@ run_ns3() {
   local seq="$3"
   local total="$4"
 
+  # Ensure tag is filesystem-safe (no spaces)
+  tag="${tag// /_}"
   local log_path="$OUTDIR/logs/${tag}.log"
 
   log "[P8] [${seq}/${total}] RUN start  ${tag}"
@@ -176,37 +172,54 @@ usage() {
   cat <<EOF
 Usage: ./scripts/run_p8.sh
 
-Environment overrides (examples):
+Overrides:
   NS3_DIR=~/ns-3 OUTDIR=results/p8 ./scripts/run_p8.sh
-  SCEN_SRC=./scenarios/p8_final_simulator_fixed.cc ./scripts/run_p8.sh
+  SCEN_SRC=./scenarios/p8_qos_wmm.cc ./scripts/run_p8.sh
   CLEAN=false QUIET_RUN=false ./scripts/run_p8.sh
   STOP_ON_FIRST_FAIL=true ./scripts/run_p8.sh
 
-Key toggles:
-  CLEAN=true|false              (default: true)
-  QUIET_BUILD=true|false        (default: true)
-  QUIET_RUN=true|false          (default: true)
-  STOP_ON_FIRST_FAIL=true|false (default: false)
+Sweep:
+  BE_RATES="0,10,20,40,60"
 EOF
 }
 
 report_outputs() {
   echo
   echo "====================== [P8] Summary ======================"
+  echo "NS3_DIR : $NS3_DIR"
+  echo "Scenario: $SCENARIO"
   echo "OutDir  : $OUTDIR"
   echo "Logs    : $OUTDIR/logs"
   echo "Raw     : $OUTDIR/raw"
-  echo "Heatmaps: $OUTDIR/heatmaps"
+  echo "Plots   : $OUTDIR/plots"
   echo "----------------------------------------------------------"
   echo "[P8] Required files check (best-effort):"
 
-  # These depend on your C++ implementation (but are expected in the fixed version)
   exists_ok "$OUTDIR/raw/p8_summary.csv" || true
-  exists_ok "$OUTDIR/raw/baseline_summary.csv" || true
-  exists_ok "$OUTDIR/raw/qos_summary.csv" || true
-  exists_ok "$OUTDIR/heatmaps/heatmap.csv" || true
+  exists_ok "$OUTDIR/raw/p8_flowmon.xml" || true
 
   echo "=========================================================="
+}
+
+# Parse comma-separated BE_RATES into global array RATES_ARR
+parse_rates() {
+  local csv="$1"
+  IFS=',' read -r -a RATES_ARR <<< "$csv"
+}
+
+# Common args builder (must match your C++ CommandLine)
+common_args() {
+  local runnum="$1"
+  echo "\
+--duration=${DURATION} --appStart=${APPSTART} \
+--standard=${STANDARD} --dataMode=${DATAMODE} --ctrlMode=${CTRLMODE} \
+--txPowerDbm=${TXPWR} \
+--channelWidth=${CHWIDTH} --channelNumber=${CHANNELNUM} \
+--outDir=${OUTDIR} --pcap=${PCAP} --flowmon=${FLOWMON} \
+--seed=${SEED} --run=${runnum} \
+--voPktSize=${VOIP_PKTSIZE} --voPps=${VOIP_PPS} \
+--viPktSize=${VIDEO_PKTSIZE} --viRateMbps=${VIDEO_RATE_MBPS} \
+--bePktSize=${BE_PKTSIZE}"
 }
 
 # ---------------------------- Main ----------------------------
@@ -222,66 +235,46 @@ main() {
 
   ensure_dirs
 
-  # Always clean by default (per your requirement).
   if [[ "$CLEAN" == "true" ]]; then
     clean_outputs
   else
     log "[P8] CLEAN disabled; existing outputs may be overwritten/appended"
   fi
 
+  init_csv
   stage_scenario
   build_ns3
 
-  # Total runs:
-  # baseline(1) + qos(off,on)=2 + heatmap grid = len(X)*len(Y)
-  local HEAT_RUNS=$(( ${#X_POINTS[@]} * ${#Y_POINTS[@]} ))
-  local TOTAL_RUNS=$(( 1 + 2 + HEAT_RUNS ))
+  parse_rates "$BE_RATES"
+  local rates_arr=("${RATES_ARR[@]}")
+
+  local SWEEP_RUNS=$(( ${#rates_arr[@]} * 2 ))
+  local TOTAL_RUNS=$(( 1 + 2 + SWEEP_RUNS ))  # baseline + congestion(OFF/ON) + sweep
 
   local FAIL=0
   local IDX=0
 
-  # ---------------- baseline ----------------
-  local runnum=$((RUN_BASE + IDX))
-  local seq=$((IDX + 1))
-  local tag="baseline_${BASE_TRANSPORT}_d${BASE_DISTANCE}_run${runnum}"
+  # ---------------- baseline (VO+VI only) ----------------
+  {
+    local runnum=$((RUN_BASE + IDX))
+    local seq=$((IDX + 1))
+    local tag="baseline_vo_vi_only_run${runnum}"
+    local args
+    args="$(common_args "$runnum") --mode=OFF --beRateMbps=0"
+    if ! run_ns3 "$tag" "$args" "$seq" "$TOTAL_RUNS"; then
+      FAIL=$((FAIL + 1))
+      [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && report_outputs && die "[P8] Aborting on first failure"
+    fi
+    IDX=$((IDX + 1))
+  }
 
-  local args="\
---scenario=baseline \
---outDir=${OUTDIR} --ssid=${SSID} \
---pcap=${PCAP} --flowmon=${FLOWMON} \
---seed=${SEED} --run=${runnum} \
---txPowerDbm=${TXPWR} --logExp=${LOGEXP} \
---transport=${BASE_TRANSPORT} \
---simTime=${BASE_SIMTIME} --appStart=${BASE_APPSTART} \
---distance=${BASE_DISTANCE} \
---pktSize=${BASE_PKTSIZE} \
---udpRate=${BASE_UDPRATE} \
---tcpMaxBytes=${BASE_TCPMAXBYTES}"
-
-  if ! run_ns3 "$tag" "$args" "$seq" "$TOTAL_RUNS"; then
-    FAIL=$((FAIL + 1))
-    [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && report_outputs && die "[P8] Aborting on first failure"
-  fi
-  IDX=$((IDX + 1))
-
-  # ---------------- qos OFF / ON ----------------
-  for mode in off on; do
-    runnum=$((RUN_BASE + IDX))
-    seq=$((IDX + 1))
-    tag="qos_${mode}_run${runnum}"
-
-    args="\
---scenario=qos \
---outDir=${OUTDIR} --ssid=${SSID} \
---pcap=${PCAP} --flowmon=${FLOWMON} \
---seed=${SEED} --run=${runnum} \
---txPowerDbm=${TXPWR} --logExp=${LOGEXP} \
---simTime=${QOS_SIMTIME} --appStart=${QOS_APPSTART} \
---qosMode=${mode} \
---voipPktSize=${VOIP_PKTSIZE} --voipIntervalMs=${VOIP_INTERVAL_MS} \
---videoPktSize=${VIDEO_PKTSIZE} --videoRate=${VIDEO_RATE} \
---bePktSize=${BE_PKTSIZE} --beRate=${BE_RATE}"
-
+  # ---------------- congestion OFF/ON at BE_RATE_DEFAULT ----------------
+  for MODE in OFF ON; do
+    local runnum=$((RUN_BASE + IDX))
+    local seq=$((IDX + 1))
+    local tag="congestion_${MODE}_be${BE_RATE_DEFAULT}_run${runnum}"
+    local args
+    args="$(common_args "$runnum") --mode=${MODE} --beRateMbps=${BE_RATE_DEFAULT}"
     if ! run_ns3 "$tag" "$args" "$seq" "$TOTAL_RUNS"; then
       FAIL=$((FAIL + 1))
       [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && report_outputs && die "[P8] Aborting on first failure"
@@ -289,24 +282,14 @@ main() {
     IDX=$((IDX + 1))
   done
 
-  # ---------------- heatmap grid (single point per run) ----------------
-  for x in "${X_POINTS[@]}"; do
-    for y in "${Y_POINTS[@]}"; do
-      runnum=$((RUN_BASE + IDX))
-      seq=$((IDX + 1))
-      tag="heatmap_x${x}_y${y}_run${runnum}"
-
-      args="\
---scenario=heatmap \
---heatmapMode=single \
---outDir=${OUTDIR} --ssid=${SSID} \
---pcap=${PCAP} --flowmon=${FLOWMON} \
---seed=${SEED} --run=${runnum} \
---txPowerDbm=${TXPWR} --logExp=${LOGEXP} \
---heatSimTime=${HEAT_SIMTIME} --heatAppStart=${HEAT_APPSTART} \
---heatPktSize=${HEAT_PKTSIZE} --heatUdpRate=${HEAT_UDPRATE} \
---x=${x} --y=${y}"
-
+  # ---------------- sweep BE rates (recommended) ----------------
+  for R in "${rates_arr[@]}"; do
+    for MODE in OFF ON; do
+      local runnum=$((RUN_BASE + IDX))
+      local seq=$((IDX + 1))
+      local tag="sweep_${MODE}_be${R}_run${runnum}"
+      local args
+      args="$(common_args "$runnum") --mode=${MODE} --beRateMbps=${R}"
       if ! run_ns3 "$tag" "$args" "$seq" "$TOTAL_RUNS"; then
         FAIL=$((FAIL + 1))
         [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && report_outputs && die "[P8] Aborting on first failure"
@@ -315,7 +298,6 @@ main() {
     done
   done
 
-  # Post-run verification + summary
   report_outputs
 
   if [[ $FAIL -ne 0 ]]; then

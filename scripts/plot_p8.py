@@ -1,493 +1,430 @@
 #!/usr/bin/env python3
+"""
+scripts/plot_p8.py
+
+Project 8 plotting script (ns-3 QoS/WMM):
+- Reads results/p8/raw/p8_summary.csv
+- Produces publication-quality plots (PNG only):
+  * Delay/Jitter vs BE rate for VO & VI (OFF vs ON)
+  * Goodput vs BE rate for VO, VI, BE (OFF vs ON)
+  * Loss vs BE rate for VO & VI (OFF vs ON) with proper y-scaling
+  * Optional bar chart for a chosen BE rate (default 40 Mbps): OFF vs ON
+
+Outputs:
+- PNG figures in results/p8/plots/
+
+Requirements:
+  pip install pandas numpy matplotlib
+"""
+
 from __future__ import annotations
 
-import csv
-import math
-import os
+import argparse
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")  # headless-safe
 import matplotlib.pyplot as plt
+
+
+REQUIRED_COLS = [
+    "mode", "beRateMbps", "seed", "run",
+    "goodputBE", "goodputVO", "goodputVI",
+    "delayVO_ms", "jitterVO_ms", "lossVO",
+    "delayVI_ms", "jitterVI_ms", "lossVI",
+]
+
+METRICS = [
+    "goodputBE", "goodputVO", "goodputVI",
+    "delayVO_ms", "jitterVO_ms", "lossVO",
+    "delayVI_ms", "jitterVI_ms", "lossVI",
+]
+
+
+@dataclass
+class PlotCfg:
+    dpi: int = 200
+    ci: str = "95"                  # "none" | "std" | "95"
+    min_n_for_ci: int = 5           # show CI only if n >= this
+    show_raw_points: bool = True    # scatter per-run points behind means
+    raw_alpha: float = 0.25
+    grid: bool = True
+    logy_delay: bool = False
+    logy_jitter: bool = False
+    loss_scale: str = "auto"        # "auto" | "0-1" | "log"
+
+
+def repo_root_from_script() -> Path:
+    # Assumes this script is in <repo>/scripts/plot_p8.py
+    return Path(__file__).resolve().parents[1]
 
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def read_csv_rows(path: Path) -> List[dict]:
-    rows: List[dict] = []
-    if not path.exists():
-        return rows
-    with path.open("r", newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            if not r:
-                continue
-            # Skip duplicated header lines (common when appending CSV)
-            if any(k == v for k, v in r.items() if k is not None and v is not None):
-                continue
-            rows.append(r)
-    return rows
+def read_and_validate(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"CSV missing columns: {missing}\nFound columns: {list(df.columns)}"
+        )
+
+    # Normalize mode to OFF/ON
+    df["mode"] = df["mode"].astype(str).str.strip().str.upper()
+
+    # Coerce numeric columns
+    for c in [x for x in REQUIRED_COLS if x != "mode"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Drop broken rows
+    df = df.dropna(subset=["mode", "beRateMbps", "run"]).copy()
+
+    # Sort for plotting
+    df = df.sort_values(["beRateMbps", "mode", "run"]).reset_index(drop=True)
+    return df
 
 
-def to_float(x: Optional[str], default: float = float("nan")) -> float:
-    if x is None:
-        return default
-    s = str(x).strip()
-    if s == "" or s.lower() == "nan":
-        return default
-    try:
-        return float(s)
-    except ValueError:
-        return default
+def t_critical_95(n: int) -> float:
+    """Approx t critical for 95% CI (two-sided) without scipy."""
+    if n <= 1:
+        return float("nan")
+    dof = n - 1
+    lookup = {
+        1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+        6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+        15: 2.131, 20: 2.086, 25: 2.060, 30: 2.042, 40: 2.021,
+        60: 2.000, 120: 1.980,
+    }
+    if dof in lookup:
+        return lookup[dof]
+    keys = sorted(lookup.keys())
+    if dof < keys[0]:
+        return lookup[keys[0]]
+    if dof > keys[-1]:
+        return 1.96
+    lo = max(k for k in keys if k < dof)
+    hi = min(k for k in keys if k > dof)
+    w = (dof - lo) / (hi - lo)
+    return lookup[lo] * (1 - w) + lookup[hi] * w
 
 
-def to_int(x: Optional[str], default: int = 0) -> int:
-    if x is None:
-        return default
-    s = str(x).strip()
-    if s == "":
-        return default
-    try:
-        return int(float(s))
-    except ValueError:
-        return default
+def aggregate(df: pd.DataFrame) -> pd.DataFrame:
+    g = df.groupby(["mode", "beRateMbps"], as_index=False)
+    agg = g[METRICS].agg(["mean", "std", "count"])
+    agg.columns = ["_".join([c for c in col if c]) for col in agg.columns.to_flat_index()]
+    agg = agg.rename(columns={"mode_": "mode", "beRateMbps_": "beRateMbps"})
+
+    # CI95 half-width
+    for m in METRICS:
+        n = agg[f"{m}_count"].astype(int).to_numpy()
+        std = agg[f"{m}_std"].astype(float).to_numpy()
+        sem = std / np.sqrt(np.maximum(n, 1))
+        tvals = np.array([t_critical_95(int(x)) for x in n], dtype=float)
+        agg[f"{m}_ci95"] = tvals * sem
+
+    return agg.sort_values(["beRateMbps", "mode"]).reset_index(drop=True)
 
 
-def quantile(values: List[float], q: float) -> float:
-    """Simple quantile without numpy; values must be non-empty."""
-    v = sorted(values)
-    if len(v) == 1:
-        return v[0]
-    q = max(0.0, min(1.0, q))
-    pos = q * (len(v) - 1)
-    lo = int(math.floor(pos))
-    hi = int(math.ceil(pos))
-    if lo == hi:
-        return v[lo]
-    w = pos - lo
-    return v[lo] * (1.0 - w) + v[hi] * w
+def _yerr(sub: pd.DataFrame, metric: str, cfg: PlotCfg) -> np.ndarray:
+    n = sub[f"{metric}_count"].to_numpy(dtype=float)
+
+    if cfg.ci == "none":
+        return np.zeros(len(sub), dtype=float)
+
+    if cfg.ci == "std":
+        y = sub[f"{metric}_std"].to_numpy(dtype=float)
+        y = np.nan_to_num(y, nan=0.0)
+        return np.where(n >= 2, y, 0.0)
+
+    # cfg.ci == "95"
+    y = sub[f"{metric}_ci95"].to_numpy(dtype=float)
+    y = np.nan_to_num(y, nan=0.0)
+    return np.where(n >= cfg.min_n_for_ci, y, 0.0)
 
 
-def robust_vmin_vmax(values: List[float]) -> Tuple[float, float]:
-    """Return a contrast-friendly [vmin, vmax]."""
-    clean = [x for x in values if not math.isnan(x)]
-    if not clean:
-        return (0.0, 1.0)
-    vmin = min(clean)
-    vmax = max(clean)
-    if vmax == vmin:
-        return (vmin - 0.5, vmax + 0.5)
-
-    q05 = quantile(clean, 0.05)
-    q95 = quantile(clean, 0.95)
-
-    # If spread is very small, keep min/max; else use percentile window.
-    if (q95 - q05) <= 0.1 * (vmax - vmin):
-        return (vmin, vmax)
-
-    return (q05, q95)
-
-
-def build_grid(
-    rows: List[dict],
-    x_key: str,
-    y_key: str,
-    val_key: str,
-    val_transform=lambda x: x,
-    invalid_pred=lambda x: False,
-) -> Tuple[List[float], List[float], List[List[Optional[float]]]]:
-    pts: Dict[Tuple[float, float], float] = {}
-
-    xs: List[float] = []
-    ys: List[float] = []
-
-    for r in rows:
-        x = to_float(r.get(x_key), float("nan"))
-        y = to_float(r.get(y_key), float("nan"))
-        if math.isnan(x) or math.isnan(y):
-            continue
-        xs.append(x)
-        ys.append(y)
-
-        raw = to_float(r.get(val_key), float("nan"))
-        if math.isnan(raw) or invalid_pred(raw):
-            pts[(x, y)] = float("nan")
-        else:
-            pts[(x, y)] = val_transform(raw)
-
-    xs_u = sorted(set(xs))
-    ys_u = sorted(set(ys))
-
-    grid: List[List[Optional[float]]] = []
-    for yy in ys_u:
-        row_vals: List[Optional[float]] = []
-        for xx in xs_u:
-            v = pts.get((xx, yy), float("nan"))
-            if math.isnan(v):
-                row_vals.append(None)
-            else:
-                row_vals.append(v)
-        grid.append(row_vals)
-
-    return xs_u, ys_u, grid
-
-
-def grid_to_values(grid: List[List[Optional[float]]]) -> List[float]:
-    out: List[float] = []
-    for row in grid:
-        for v in row:
-            if v is None:
-                continue
-            out.append(v)
-    return out
-
-
-def draw_heatmap(
-    xs: List[float],
-    ys: List[float],
-    grid: List[List[Optional[float]]],
+def line_plot(
+    df_raw: pd.DataFrame,
+    agg: pd.DataFrame,
+    metric: str,
+    ylabel: str,
     title: str,
-    cbar_label: str,
-    out_png: Path,
-    annotate: bool = True,
-) -> None:
-    values = grid_to_values(grid)
-    if not values:
-        return
+    cfg: PlotCfg,
+    ylog: bool = False,
+    loss_plot: bool = False,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
 
-    vmin, vmax = robust_vmin_vmax(values)
+    mode_order = ["OFF", "ON"] if set(["OFF", "ON"]).issubset(set(agg["mode"])) else sorted(agg["mode"].unique())
 
-    # Convert grid (with None) to a masked-like structure using NaN
-    data: List[List[float]] = []
-    for row in grid:
-        data.append([float("nan") if v is None else float(v) for v in row])
+    style = {
+        "OFF": dict(marker="o", linestyle="-", linewidth=2.0),
+        "ON":  dict(marker="s", linestyle="--", linewidth=2.0),
+    }
 
-    plt.close("all")
-    fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+    x_ticks = sorted(agg["beRateMbps"].unique().tolist())
 
-    # Determine cell boundaries so ticks align to actual x/y positions
-    # Assumes uniform step; if not uniform, we still label by tick positions.
-    im = ax.imshow(
-        data,
-        origin="lower",
-        aspect="auto",
-        interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
-    )
+    for mode in mode_order:
+        sub = agg[agg["mode"] == mode].sort_values("beRateMbps")
+        if sub.empty:
+            continue
 
-    ax.set_title(title, pad=12)
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("y (m)")
+        x = sub["beRateMbps"].to_numpy(dtype=float)
+        y = sub[f"{metric}_mean"].to_numpy(dtype=float)
+        yerr = _yerr(sub, metric, cfg)
 
-    ax.set_xticks(list(range(len(xs))))
-    ax.set_xticklabels([f"{x:g}" for x in xs])
-    ax.set_yticks(list(range(len(ys))))
-    ax.set_yticklabels([f"{y:g}" for y in ys])
+        # raw points
+        if cfg.show_raw_points:
+            raw_sub = df_raw[df_raw["mode"] == mode]
+            ax.scatter(
+                raw_sub["beRateMbps"].to_numpy(dtype=float),
+                raw_sub[metric].to_numpy(dtype=float),
+                s=18,
+                alpha=cfg.raw_alpha,
+                zorder=1,
+            )
 
-    # Light grid between cells
-    ax.set_xticks([i - 0.5 for i in range(1, len(xs))], minor=True)
-    ax.set_yticks([i - 0.5 for i in range(1, len(ys))], minor=True)
-    ax.grid(which="minor", linestyle="-", linewidth=0.5, alpha=0.35)
-    ax.tick_params(which="minor", bottom=False, left=False)
+        st = style.get(mode, dict(marker="o", linestyle="-", linewidth=2.0))
+        ax.errorbar(
+            x, y, yerr=yerr,
+            capsize=3,
+            label=mode,
+            zorder=3,
+            **st
+        )
 
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label(cbar_label)
+    ax.set_xlabel("BE offered rate (Mbps)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.set_xticks(x_ticks)
 
-    # Annotate values if grid is small enough
-    if annotate and (len(xs) * len(ys) <= 64):
-        for yi in range(len(ys)):
-            for xi in range(len(xs)):
-                v = grid[yi][xi]
-                if v is None:
-                    continue
+    if cfg.grid:
+        ax.grid(True, which="both", linestyle="--", linewidth=0.8, alpha=0.6)
+
+    ax.legend(loc="best")
+
+    if loss_plot:
+        if cfg.loss_scale == "0-1":
+            ax.set_ylim(0.0, 1.0)
+        elif cfg.loss_scale == "log":
+            ax.set_yscale("log")
+            ax.set_ylim(1e-6, 1.0)
+        else:
+            y_all = agg[f"{metric}_mean"].to_numpy(dtype=float)
+            e_all = agg[f"{metric}_ci95"].to_numpy(dtype=float)
+            ymax = float(np.nanmax(y_all + np.nan_to_num(e_all, nan=0.0)))
+            if not np.isfinite(ymax) or ymax <= 0.0:
+                ymax = 1e-4
+            ax.set_ylim(0.0, max(1.2 * ymax, 1e-4))
+
+            if np.nanmax(np.abs(y_all)) == 0.0:
                 ax.text(
-                    xi,
-                    yi,
-                    f"{v:.3f}",
-                    ha="center",
-                    va="center",
-                    fontsize=8,
-                    alpha=0.9,
+                    0.5, 0.5, "All loss values are 0 in this dataset",
+                    transform=ax.transAxes,
+                    ha="center", va="center",
+                    fontsize=10,
+                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.2),
                 )
 
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-
-def draw_scatter_rtt_goodput(
-    heat_rows: List[dict],
-    out_png: Path,
-    ap_x: float = 0.0,
-    ap_y: float = 0.0,
-) -> None:
-    pts: List[Tuple[float, float, float]] = []  # (goodput_mbps, rtt_ms, dist_m)
-    for r in heat_rows:
-        x = to_float(r.get("x"), float("nan"))
-        y = to_float(r.get("y"), float("nan"))
-        gp_bps = to_float(r.get("goodputbps"), float("nan"))
-        rtt = to_float(r.get("rttMeanMs"), float("nan"))
-        if math.isnan(x) or math.isnan(y) or math.isnan(gp_bps) or math.isnan(rtt):
-            continue
-        if rtt < 0:
-            continue
-        gp = gp_bps / 1e6
-        d = math.hypot(x - ap_x, y - ap_y)
-        pts.append((gp, rtt, d))
-
-    if len(pts) < 3:
-        return
-
-    plt.close("all")
-    fig, ax = plt.subplots(figsize=(9, 6), dpi=150)
-
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    cs = [p[2] for p in pts]
-
-    sc = ax.scatter(xs, ys, c=cs, s=55, alpha=0.9)
-    ax.set_title("P8 - RTT vs Goodput (colored by distance)", pad=12)
-    ax.set_xlabel("Goodput (Mbps)")
-    ax.set_ylabel("RTT mean (ms)")
-    ax.grid(True, linestyle="--", alpha=0.35)
-
-    cbar = fig.colorbar(sc, ax=ax)
-    cbar.set_label("Distance from AP (m)")
+    if ylog:
+        ax.set_yscale("log")
 
     fig.tight_layout()
-    fig.savefig(out_png, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    return fig
 
 
-def group_qos(rows: List[dict]) -> Dict[str, Dict[str, dict]]:
-    """
-    Returns:
-      flowType -> qosMode -> metrics dict
-    """
-    out: Dict[str, Dict[str, dict]] = {}
-    for r in rows:
-        mode = (r.get("qosMode") or "").strip().lower()
-        flow = (r.get("flowType") or "").strip()
-        if not mode or not flow:
-            continue
-        gp_mbps = to_float(r.get("goodputbps"), float("nan")) / 1e6
-        delay_ms = to_float(r.get("meanDelayMs"), float("nan"))
-        loss = to_float(r.get("lossRate"), float("nan"))
-        out.setdefault(flow, {})[mode] = {
-            "goodput_mbps": gp_mbps,
-            "delay_ms": delay_ms,
-            "loss_rate": loss,
-        }
-    return out
+def bar_compare_at_rate(
+    agg: pd.DataFrame,
+    be_rate: float,
+    metrics: List[Tuple[str, str]],
+    cfg: PlotCfg,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(10.5, 4.2))
 
-
-def draw_qos_bars(
-    qos_rows: List[dict],
-    out_dir: Path,
-) -> None:
-    g = group_qos(qos_rows)
-    if not g:
-        return
-
-    flows = sorted(g.keys())
-    have_on = all("on" in g[f] for f in flows)
-    have_off = all("off" in g[f] for f in flows)
-    if not (have_on and have_off):
-        return
-
-    metrics = [
-        ("delay_ms", "Mean delay (ms)", "P8 - QoS ON/OFF Delay"),
-        ("goodput_mbps", "Mean goodput (Mbps)", "P8 - QoS ON/OFF Goodput"),
-        ("loss_rate", "Loss rate", "P8 - QoS ON/OFF Loss"),
-    ]
-
-    for key, ylabel, title in metrics:
-        plt.close("all")
-        fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
-
-        x = list(range(len(flows)))
-        width = 0.36
-
-        off_vals = [g[f]["off"][key] for f in flows]
-        on_vals = [g[f]["on"][key] for f in flows]
-
-        ax.bar([i - width / 2 for i in x], off_vals, width=width, label="QoS OFF")
-        ax.bar([i + width / 2 for i in x], on_vals, width=width, label="QoS ON")
-
-        ax.set_title(title, pad=12)
-        ax.set_ylabel(ylabel)
-        ax.set_xticks(x)
-        ax.set_xticklabels(flows)
-        ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-        ax.legend()
-
+    sub = agg[np.isclose(agg["beRateMbps"].astype(float), float(be_rate))].copy()
+    if sub.empty:
+        ax.text(0.5, 0.5, f"No data for BE rate={be_rate}", ha="center", va="center")
+        ax.axis("off")
         fig.tight_layout()
-        fig.savefig(out_dir / f"p8_qos_{key}_on_off.png", dpi=300, bbox_inches="tight")
-        plt.close(fig)
+        return fig
 
-        # Delta plot (ON - OFF)
-        plt.close("all")
-        fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
-        delta = [g[f]["on"][key] - g[f]["off"][key] for f in flows]
+    mode_order = ["OFF", "ON"]
+    sub["mode"] = sub["mode"].astype(str)
+    sub = sub.set_index("mode").reindex(mode_order)
 
-        ax.bar(x, delta)
-        ax.axhline(0.0, linestyle="--", linewidth=1.0, alpha=0.6)
+    labels = [lbl for _, lbl in metrics]
+    x = np.arange(len(metrics))
+    width = 0.38
 
-        ax.set_title(f"P8 - QoS Delta {key} (ON - OFF)", pad=12)
-        ax.set_ylabel(f"Delta ({ylabel})")
-        ax.set_xticks(x)
-        ax.set_xticklabels(flows)
-        ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-
-        fig.tight_layout()
-        fig.savefig(out_dir / f"p8_qos_delta_{key}.png", dpi=300, bbox_inches="tight")
-        plt.close(fig)
-
-
-def draw_baseline_sweeps(baseline_rows: List[dict], out_dir: Path) -> None:
-    if not baseline_rows:
-        return
-
-    # Clean and normalize
-    clean = []
-    for r in baseline_rows:
-        transport = (r.get("transport") or "").strip().lower()
-        if transport in ("", "transport"):
+    for i, mode in enumerate(mode_order):
+        if mode not in sub.index or sub.loc[mode].isna().all():
             continue
-        d = to_float(r.get("distance"), float("nan"))
-        gp = to_float(r.get("goodputbps"), float("nan")) / 1e6
-        rtt = to_float(r.get("rttMeanMs"), float("nan"))
-        if math.isnan(d) or math.isnan(gp):
-            continue
-        clean.append((transport, d, gp, rtt))
 
-    if len(clean) < 2:
-        return
+        means = np.array([sub.loc[mode, f"{m}_mean"] for m, _ in metrics], dtype=float)
 
-    transports = sorted(set(t for t, _, _, _ in clean))
+        yerr = []
+        for m, _ in metrics:
+            n = int(sub.loc[mode, f"{m}_count"]) if np.isfinite(sub.loc[mode, f"{m}_count"]) else 0
+            if cfg.ci == "95" and n >= cfg.min_n_for_ci:
+                yerr.append(float(sub.loc[mode, f"{m}_ci95"]))
+            elif cfg.ci == "std" and n >= 2:
+                yerr.append(float(sub.loc[mode, f"{m}_std"]))
+            else:
+                yerr.append(0.0)
+        yerr = np.array(yerr, dtype=float)
 
-    # Distance vs Goodput
-    plt.close("all")
-    fig, ax = plt.subplots(figsize=(9, 6), dpi=150)
-    for t in transports:
-        pts = sorted([(d, gp) for tt, d, gp, _ in clean if tt == t], key=lambda x: x[0])
-        if len(pts) < 2:
-            continue
-        ax.plot([p[0] for p in pts], [p[1] for p in pts], marker="o", label=t.upper())
-    ax.set_title("P8 - Baseline Distance vs Goodput", pad=12)
-    ax.set_xlabel("Distance (m)")
-    ax.set_ylabel("Goodput (Mbps)")
-    ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend()
+        offset = (i - 0.5) * width
+        ax.bar(x + offset, means, width, yerr=yerr, capsize=3, label=mode)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_title(f"OFF vs ON at BE rate = {be_rate} Mbps")
+    if cfg.grid:
+        ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax.legend(loc="best")
     fig.tight_layout()
-    fig.savefig(out_dir / "p8_baseline_distance_goodput.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    return fig
 
-    # Distance vs RTT (only if RTT is valid)
-    any_rtt = any((not math.isnan(rtt)) and rtt >= 0 for _, _, _, rtt in clean)
-    if any_rtt:
-        plt.close("all")
-        fig, ax = plt.subplots(figsize=(9, 6), dpi=150)
-        for t in transports:
-            pts = sorted([(d, rtt) for tt, d, _, rtt in clean if tt == t and (not math.isnan(rtt)) and rtt >= 0],
-                         key=lambda x: x[0])
-            if len(pts) < 2:
-                continue
-            ax.plot([p[0] for p in pts], [p[1] for p in pts], marker="o", label=t.upper())
-        ax.set_title("P8 - Baseline Distance vs RTT", pad=12)
-        ax.set_xlabel("Distance (m)")
-        ax.set_ylabel("RTT mean (ms)")
-        ax.grid(True, linestyle="--", alpha=0.35)
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(out_dir / "p8_baseline_distance_rtt.png", dpi=300, bbox_inches="tight")
-        plt.close(fig)
+
+def save_png(fig: plt.Figure, png_path: Path, cfg: PlotCfg) -> None:
+    fig.savefig(png_path, dpi=cfg.dpi)
+    plt.close(fig)
 
 
 def main() -> None:
-    # Resolve repo root assuming this script is under WIFI-TER-SIM/scripts/
-    here = Path(__file__).resolve()
-    repo_root = here.parents[1]
-    p8_dir = repo_root / "results" / "p8"
-    plots_dir = p8_dir / "plots"
+    root = repo_root_from_script()
+
+    p = argparse.ArgumentParser(description="Plot Project 8 (QoS/WMM) results from p8_summary.csv")
+    p.add_argument("--csv", type=str, default=str(root / "results" / "p8" / "raw" / "p8_summary.csv"),
+                   help="Path to p8_summary.csv")
+    p.add_argument("--outdir", type=str, default=str(root / "results" / "p8"),
+                   help="Project output dir (contains raw/, logs/, plots/...)")
+    p.add_argument("--dpi", type=int, default=200, help="PNG DPI")
+    p.add_argument("--ci", type=str, default="95", choices=["none", "std", "95"],
+                   help="Error bars: none | std | 95 (95% CI)")
+    p.add_argument("--min-n-ci", type=int, default=5,
+                   help="Show 95% CI only if count >= this (default: 5)")
+    p.add_argument("--no-raw", action="store_true", help="Disable raw per-run scatter points")
+    p.add_argument("--logy-delay", action="store_true", help="Log scale for delay plots")
+    p.add_argument("--logy-jitter", action="store_true", help="Log scale for jitter plots")
+    p.add_argument("--loss-scale", type=str, default="auto", choices=["auto", "0-1", "log"],
+                   help="Loss y-axis scaling: auto (zoom), 0-1, or log")
+    p.add_argument("--bar-be-rate", type=float, default=40.0,
+                   help="BE rate for OFF/ON bar comparison plot")
+    args = p.parse_args()
+
+    outdir = Path(args.outdir).resolve()
+    csv_path = Path(args.csv).resolve()
+    plots_dir = outdir / "plots"
     ensure_dir(plots_dir)
 
-    heatmap_csv = p8_dir / "heatmaps" / "heatmap.csv"
-    qos_csv = p8_dir / "raw" / "qos_summary.csv"
-    baseline_csv = p8_dir / "raw" / "baseline_summary.csv"
+    cfg = PlotCfg(
+        dpi=int(args.dpi),
+        ci=str(args.ci),
+        min_n_for_ci=int(args.min_n_ci),
+        show_raw_points=(not args.no_raw),
+        logy_delay=bool(args.logy_delay),
+        logy_jitter=bool(args.logy_jitter),
+        loss_scale=str(args.loss_scale),
+    )
 
-    heat_rows = read_csv_rows(heatmap_csv)
-    qos_rows = read_csv_rows(qos_csv)
-    baseline_rows = read_csv_rows(baseline_csv)
+    # nicer defaults
+    plt.rcParams.update({
+        "figure.facecolor": "white",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 12,
+        "axes.titlesize": 14,
+        "legend.frameon": True,
+        "legend.framealpha": 0.9,
+        "font.size": 11,
+    })
 
-    # Heatmap: Goodput (Mbps)
-    if heat_rows:
-        xs, ys, gp_grid = build_grid(
-            heat_rows,
-            x_key="x",
-            y_key="y",
-            val_key="goodputbps",
-            val_transform=lambda bps: bps / 1e6,
-            invalid_pred=lambda v: v < 0,
-        )
-        draw_heatmap(
-            xs,
-            ys,
-            gp_grid,
-            title="P8 - Goodput Heatmap (autoscaled)",
-            cbar_label="Goodput (Mbps)",
-            out_png=plots_dir / "p8_goodput_heatmap.png",
-            annotate=True,
-        )
+    df = read_and_validate(csv_path)
+    agg = aggregate(df)
 
-        # Heatmap: RTT (ms)
-        xs2, ys2, rtt_grid = build_grid(
-            heat_rows,
-            x_key="x",
-            y_key="y",
-            val_key="rttMeanMs",
-            val_transform=lambda ms: ms,
-            invalid_pred=lambda v: v < 0,
-        )
-        draw_heatmap(
-            xs2,
-            ys2,
-            rtt_grid,
-            title="P8 - RTT Heatmap (autoscaled)",
-            cbar_label="RTT mean (ms)",
-            out_png=plots_dir / "p8_rtt_heatmap.png",
-            annotate=True,
-        )
+    # Print aggregated stats to console (NO CSV written)
+    print("\n=== Aggregated stats (mode, beRateMbps) ===")
+    cols_to_show = [
+        "mode", "beRateMbps",
+        "goodputBE_mean", "goodputVO_mean", "goodputVI_mean",
+        "delayVO_ms_mean", "jitterVO_ms_mean", "lossVO_mean",
+        "delayVI_ms_mean", "jitterVI_ms_mean", "lossVI_mean",
+    ]
+    existing = [c for c in cols_to_show if c in agg.columns]
+    print(agg[existing].to_string(index=False))
 
-        # Scatter: RTT vs Goodput
-        draw_scatter_rtt_goodput(
-            heat_rows,
-            out_png=plots_dir / "p8_rtt_vs_goodput_scatter.png",
-            ap_x=0.0,
-            ap_y=0.0,
-        )
+    # ---- Save PNGs only ----
+    save_png(
+        line_plot(df, agg, "delayVO_ms", "Mean delay VO (ms)", "VO delay vs BE rate",
+                  cfg, ylog=cfg.logy_delay),
+        plots_dir / "p8_vo_delay.png", cfg
+    )
+    save_png(
+        line_plot(df, agg, "jitterVO_ms", "Mean jitter VO (ms)", "VO jitter vs BE rate",
+                  cfg, ylog=cfg.logy_jitter),
+        plots_dir / "p8_vo_jitter.png", cfg
+    )
+    save_png(
+        line_plot(df, agg, "delayVI_ms", "Mean delay VI (ms)", "VI delay vs BE rate",
+                  cfg, ylog=cfg.logy_delay),
+        plots_dir / "p8_vi_delay.png", cfg
+    )
+    save_png(
+        line_plot(df, agg, "jitterVI_ms", "Mean jitter VI (ms)", "VI jitter vs BE rate",
+                  cfg, ylog=cfg.logy_jitter),
+        plots_dir / "p8_vi_jitter.png", cfg
+    )
 
-    # QoS comparisons
-    if qos_rows:
-        draw_qos_bars(qos_rows, plots_dir)
+    save_png(
+        line_plot(df, agg, "goodputVO", "Goodput VO (Mbps)", "VO goodput vs BE rate", cfg),
+        plots_dir / "p8_vo_goodput.png", cfg
+    )
+    save_png(
+        line_plot(df, agg, "goodputVI", "Goodput VI (Mbps)", "VI goodput vs BE rate", cfg),
+        plots_dir / "p8_vi_goodput.png", cfg
+    )
+    save_png(
+        line_plot(df, agg, "goodputBE", "Goodput BE (Mbps)", "BE goodput vs BE rate", cfg),
+        plots_dir / "p8_be_goodput.png", cfg
+    )
 
-    # Baseline sweeps (if multiple distances/transports exist)
-    if baseline_rows:
-        draw_baseline_sweeps(baseline_rows, plots_dir)
+    save_png(
+        line_plot(df, agg, "lossVO", "Loss ratio VO", "VO loss vs BE rate",
+                  cfg, loss_plot=True),
+        plots_dir / "p8_vo_loss.png", cfg
+    )
+    save_png(
+        line_plot(df, agg, "lossVI", "Loss ratio VI", "VI loss vs BE rate",
+                  cfg, loss_plot=True),
+        plots_dir / "p8_vi_loss.png", cfg
+    )
 
-    print(f"[P8] Saved plots to: {plots_dir}")
+    bar_metrics = [
+        ("delayVO_ms", "VO delay (ms)"),
+        ("jitterVO_ms", "VO jitter (ms)"),
+        ("delayVI_ms", "VI delay (ms)"),
+        ("jitterVI_ms", "VI jitter (ms)"),
+    ]
+    save_png(
+        bar_compare_at_rate(agg, args.bar_be_rate, bar_metrics, cfg),
+        plots_dir / "p8_bar_off_on.png", cfg
+    )
+
+    print("\n P8 PNG plots generated:")
+    print(f"  - {plots_dir}")
 
 
 if __name__ == "__main__":
-    # High-quality defaults
-    plt.rcParams.update({
-        "figure.dpi": 150,
-        "savefig.dpi": 300,
-        "font.size": 12,
-        "axes.titlesize": 16,
-        "axes.labelsize": 13,
-        "legend.fontsize": 12,
-    })
     main()
