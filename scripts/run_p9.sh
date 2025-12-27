@@ -1,136 +1,188 @@
 #!/usr/bin/env bash
-# Projet 9 runner (ns-3.41) - Safe parallel runs (no CSV corruption)
-# Machine: 8 cores (1 thread/core), RAM ~15GiB
-# Strategy:
-#  - Run simulations in parallel (default JOBS=6)
-#  - Each run writes into a private outDir: results/.../tmp_runs/<tag>
-#  - Merge tmp grid.csv + heatmap.csv into final results/.../(raw,heatmaps)
-#  - Keep only: heatmaps/ raw/ logs/ plots/
-
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------- paths --------------------
-NS3_DIR="${NS3_DIR:-$HOME/ns-3}"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# ============================================================
+# Part 4 runner (equivalent structure to Script 9)
+# Scenario: p4_phy_mac_sweep
+#
+# Key properties (مثل اسکریپت 9):
+#  - tmp_runs برای هر اجرا (عدم آسیب به داده‌ها)
+#  - اجرای موازی JOBS (پیش‌فرض 6)
+#  - Merge خروجی‌های CSV در یک فایل نهایی
+#  - Build فقط یک بار (و کم‌فشار) — در هر Run بیلد موازی انجام نمی‌شود
+#  - کنترل فشار/دما: nice + ionice + (در صورت وجود) cpulimit
+#
+# IMPORTANT:
+#  - طبق خروجی شما، گزینه --useMinstrelHe در کد فعلی وجود ندارد
+#    پس این اسکریپت آن را پاس نمی‌دهد (مثل خطای شما).
+# ============================================================
 
-SCEN_SRC="${SCEN_SRC:-$ROOT_DIR/scenarios/p9_heatmap.cc}"
-SCEN_NAME="${SCEN_NAME:-p9_heatmap}"
+# -------------------- configuration --------------------
+NS3_DIR="${NS3_DIR:-$HOME/ns-3}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+SCEN_NAME="${SCEN_NAME:-p4_phy_mac_sweep}"
+SCEN_SRC="${SCEN_SRC:-$ROOT_DIR/scenarios/${SCEN_NAME}.cc}"
 SCENARIO="${SCENARIO:-scratch/${SCEN_NAME}}"
 
-OUTDIR="${OUTDIR:-$ROOT_DIR/results/p9}"   # (اگر خواستی دقیقاً مثل PDF باشد: results/p9_heatmap) :contentReference[oaicite:2]{index=2}
-
-# -------------------- parallelism (tuned) --------------------
-# 8 cores → JOBS=6 usually safe (3-4x faster vs serial)
-JOBS="${JOBS:-6}"
-MAX_JOBS="${MAX_JOBS:-8}"   # hard cap
-
-# -------------------- behavior --------------------
-CLEAN="${CLEAN:-true}"
-STOP_ON_FIRST_FAIL="${STOP_ON_FIRST_FAIL:-false}"
-TAIL_LINES="${TAIL_LINES:-120}"
-
-# -------------------- grid (your 16x16 = 256 points) --------------------
-X_MIN="${X_MIN:-0}"
-X_MAX="${X_MAX:-30}"
-Y_MIN="${Y_MIN:--15}"
-Y_MAX="${Y_MAX:-15}"
-STEP="${STEP:-2}"
-POINTS="${POINTS:-}"   # optional: "x:y,x:y,..."
-
-# -------------------- sim args (must match C++ CLI) --------------------
-PCAP="${PCAP:-false}"
-FLOWMON="${FLOWMON:-false}"
-SEED="${SEED:-1}"
-RUN_BASE="${RUN_BASE:-1}"
-
-SIMTIME="${SIMTIME:-7.0}"
-APPSTART="${APPSTART:-2.0}"
-MEASURETIME="${MEASURETIME:-3.0}"
-
-TRANSPORT="${TRANSPORT:-udp}"
-PKTSIZE="${PKTSIZE:-1200}"
-UDPRATE="${UDPRATE:-10}"         # keep sane for heatmap (avoid saturation)
-TCPMAXBYTES="${TCPMAXBYTES:-0}"
-
-STANDARD="${STANDARD:-ax}"
-RATECONTROL="${RATECONTROL:-adaptive}"
-DATAMODE="${DATAMODE:-HeMcs7}"
-
-PROPMODEL="${PROPMODEL:-logdistance}"
-EXPONENT="${EXPONENT:-3.0}"
-
-TXPWR="${TXPWR:-20.0}"
-CHWIDTH="${CHWIDTH:-20}"
-APX="${APX:-0.0}"
-APY="${APY:-0.0}"
-
-PLOT="${PLOT:-false}"
-PLOT_SCRIPT="${PLOT_SCRIPT:-$ROOT_DIR/scripts/plot_p9.py}"
-
-# -------------------- final output dirs --------------------
-HEAT_DIR="$OUTDIR/heatmaps"
+OUTDIR="${OUTDIR:-$ROOT_DIR/results/p4}"
 RAW_DIR="$OUTDIR/raw"
 LOG_DIR="$OUTDIR/logs"
 PLOT_DIR="$OUTDIR/plots"
 TMP_ROOT="$OUTDIR/tmp_runs"
 
+CSV_OUT="${CSV_OUT:-$RAW_DIR/p4_matrix.csv}"
+CSV_HEADER="distance,channelWidth,txPowerDbm,rateMode,mcs,udpRate,pktSize,seed,run,rxBytes,goodputMbps,rttMeanMs"
+
+CLEAN="${CLEAN:-true}"
+KEEP_TMP="${KEEP_TMP:-false}"
+STOP_ON_FIRST_FAIL="${STOP_ON_FIRST_FAIL:-false}"
+
+# -------------------- parallelism --------------------
+JOBS="${JOBS:-6}"
+MAX_JOBS="${MAX_JOBS:-8}"
+TAIL_LINES="${TAIL_LINES:-120}"
+START_STAGGER_S="${START_STAGGER_S:-0.35}"   # برای جلوگیری از پیک همزمان
+
+# -------------------- build control (کم فشار) --------------------
+DO_BUILD="${DO_BUILD:-true}"
+BUILD_JOBS="${BUILD_JOBS:-2}"                # برای کاهش دما/فشار، بیلد کم‌پردازشی
+NO_BUILD_FLAG="${NO_BUILD_FLAG:-auto}"       # auto|true|false  (auto: اگر ns3 run --no-build داشت)
+
+# -------------------- thermal/load limiting --------------------
+NICE_LVL="${NICE_LVL:-10}"
+IONICE_CLASS="${IONICE_CLASS:-2}"
+IONICE_PRIO="${IONICE_PRIO:-7}"
+CPU_LIMIT_PER_JOB="${CPU_LIMIT_PER_JOB:-10}"  # فقط اگر cpulimit نصب باشد (درصد از یک CPU)
+
+# -------------------- sweep parameters (override with env) --------------------
+SIM_TIME="${SIM_TIME:-20}"
+APP_START="${APP_START:-2}"
+
+SEED="${SEED:-1}"
+RUN_BASE="${RUN_BASE:-1}"   # run = RUN_BASE + idx
+
+# Grid sets (با env هم می‌توانید override کنید)
+DISTANCES=(${DISTANCES_OVERRIDE:-5 10 20 30})
+WIDTHS=(${WIDTHS_OVERRIDE:-20 40 80})
+TXPOWERS=(${TXPOWERS_OVERRIDE:-12 16 20})
+RATEMODES=(${RATEMODES_OVERRIDE:-adaptive constant})
+MCS_LIST=(${MCS_LIST_OVERRIDE:-0 3 7 9})     # فقط برای constant استفاده می‌شود
+
+# Extra args for scenario
+SSID="${SSID:-wifi6-ter}"
+UDPRATE="${UDPRATE:-600Mbps}"
+PKTSIZE="${PKTSIZE:-1200}"
+
+LOGEXP="${LOGEXP:-3.0}"
+REFDIST="${REFDIST:-1.0}"
+REFLOSS="${REFLOSS:-46.6777}"
+NOISEFIG="${NOISEFIG:-7.0}"
+
+SHADOWING="${SHADOWING:-false}"
+SHADOWSIGMA="${SHADOWSIGMA:-5.0}"
+SHADOWUPDATE="${SHADOWUPDATE:-1.0}"
+FADING="${FADING:-false}"
+
+RTTHZ="${RTTHZ:-2.0}"
+RTTPAYLOAD="${RTTPAYLOAD:-32}"
+RTTVERBOSE="${RTTVERBOSE:-false}"
+
+PCAP="${PCAP:-false}"
+FLOWMON="${FLOWMON:-true}"
+
+USE_MINSTREL="${USE_MINSTREL:-true}"
+
+# Optional manual cases:
+# CASES="d:w:p:mode:mcs,d:w:p:mode:mcs,..."  (اگر ست می‌خواهید دقیق کنترل کنید)
+CASES="${CASES:-}"
+
+EXTRA_ARGS="${EXTRA_ARGS:-}"  # هر چیز اضافی که کد می‌پذیرد
+
+# -------------------- helpers --------------------
 ts() { date +"%Y-%m-%d %H:%M:%S"; }
 log() { echo "[$(ts)] $*"; }
 warn() { echo "[$(ts)] WARN: $*" >&2; }
 die() { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
 
+have_cpulimit() { command -v cpulimit >/dev/null 2>&1; }
+
 ensure_dirs() {
-  mkdir -p "$HEAT_DIR" "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR"
+  mkdir -p "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR"
 }
 
 clean_outputs() {
-  log "[P9] Cleaning previous outputs under: $OUTDIR"
-  rm -rf "$HEAT_DIR" "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT" || true
+  log "[P4] Cleaning previous outputs under: $OUTDIR"
+  rm -rf "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT" || true
   ensure_dirs
 }
 
 stage_scenario() {
   [[ -d "$NS3_DIR" ]] || die "NS3_DIR not found: $NS3_DIR"
   [[ -f "$SCEN_SRC" ]] || die "Scenario source not found: $SCEN_SRC"
-  local dst="$NS3_DIR/scratch/${SCEN_NAME}.cc"
-  cp -f "$SCEN_SRC" "$dst" || die "Copy to ns-3 scratch failed: $dst"
-  log "[P9] Staged scenario: $SCEN_SRC -> $dst"
+  cp -f "$SCEN_SRC" "$NS3_DIR/scratch/${SCEN_NAME}.cc" || die "Copy to ns-3 scratch failed"
+  log "[P4] Staged scenario: $SCEN_SRC -> $NS3_DIR/scratch/${SCEN_NAME}.cc"
 }
 
 build_ns3() {
-  log "[P9] Building ns-3 in: $NS3_DIR"
+  [[ "$DO_BUILD" == "true" ]] || { log "[P4] DO_BUILD=false (skipping build)"; return 0; }
+  log "[P4] Building ns-3 (low pressure) in: $NS3_DIR  (BUILD_JOBS=${BUILD_JOBS})"
   local build_log="$LOG_DIR/build.log"
-  ( cd "$NS3_DIR" && NINJAFLAGS="-j${MAX_JOBS}" ./ns3 build ) >"$build_log" 2>&1 || {
-    warn "[P9] BUILD FAILED. Last ${TAIL_LINES} lines:"
+  ( cd "$NS3_DIR" && NINJAFLAGS="-j${BUILD_JOBS}" ./ns3 build ) >"$build_log" 2>&1 || {
+    warn "[P4] BUILD FAILED. Last ${TAIL_LINES} lines:"
     tail -n "$TAIL_LINES" "$build_log" || true
     die "ns-3 build failed (full log: $build_log)"
   }
-  log "[P9] Build OK"
+  log "[P4] Build OK"
+}
+
+ns3_run_supports_no_build() {
+  ( cd "$NS3_DIR" && ./ns3 run --help 2>/dev/null | grep -q -- "--no-build" ) || return 1
+  return 0
+}
+
+use_no_build() {
+  if [[ "$NO_BUILD_FLAG" == "true" ]]; then
+    return 0
+  elif [[ "$NO_BUILD_FLAG" == "false" ]]; then
+    return 1
+  else
+    ns3_run_supports_no_build
+  fi
 }
 
 safe_tag() {
-  local x="$1" y="$2"
-  local sx="${x//-/_m}"; local sy="${y//-/_m}"
-  sx="${sx//./p}"; sy="${sy//./p}"
-  echo "x${sx}_y${sy}"
+  # similar style to p9 tags
+  local d="$1" w="$2" p="$3" mode="$4" mcs="$5" seed="$6" run="$7"
+  local sd="${d//-/_m}"; sd="${sd//./p}"
+  local sw="${w//-/_m}"; sw="${sw//./p}"
+  local sp="${p//-/_m}"; sp="${sp//./p}"
+  echo "p4_d${sd}_w${sw}_p${sp}_${mode}_mcs${mcs}_s${seed}_r${run}"
 }
 
 common_args() {
-  local out="$1" runnum="$2" x="$3" y="$4"
-  echo "\
---outDir=${out} --pcap=${PCAP} --flowmon=${FLOWMON} \
---seed=${SEED} --run=${runnum} \
---simTime=${SIMTIME} --appStart=${APPSTART} --measureTime=${MEASURETIME} \
---transport=${TRANSPORT} --pktSize=${PKTSIZE} --udpRateMbps=${UDPRATE} --tcpMaxBytes=${TCPMAXBYTES} \
---standard=${STANDARD} --rateControl=${RATECONTROL} --dataMode=${DATAMODE} \
---propModel=${PROPMODEL} --exponent=${EXPONENT} \
---txPowerDbm=${TXPWR} --channelWidth=${CHWIDTH} \
---apX=${APX} --apY=${APY} \
---x=${x} --y=${y}"
+  local out="$1" d="$2" w="$3" p="$4" mode="$5" mcs="$6" run="$7"
+
+  local args="--simTime=${SIM_TIME} --appStart=${APP_START} \
+--distance=${d} --channelWidth=${w} --txPowerDbm=${p} \
+--rateMode=${mode} --mcs=${mcs} --useMinstrel=${USE_MINSTREL} \
+--ssid=${SSID} --udpRate=${UDPRATE} --pktSize=${PKTSIZE} \
+--logExp=${LOGEXP} --refDist=${REFDIST} --refLoss=${REFLOSS} --noiseFigureDb=${NOISEFIG} \
+--enableShadowing=${SHADOWING} --shadowSigmaDb=${SHADOWSIGMA} --shadowUpdateS=${SHADOWUPDATE} \
+--enableFading=${FADING} \
+--rttHz=${RTTHZ} --rttPayloadSize=${RTTPAYLOAD} --rttVerbose=${RTTVERBOSE} \
+--pcap=${PCAP} --flowmon=${FLOWMON} \
+--seed=${SEED} --run=${run} \
+--outDir=${out} --tag="
+  if [[ -n "${EXTRA_ARGS}" ]]; then
+    args+=" ${EXTRA_ARGS}"
+  fi
+  echo "$args"
 }
 
-# Concurrency gate
 wait_for_slot() {
   while (( $(jobs -rp | wc -l) >= JOBS )); do
     wait -n || true
@@ -141,144 +193,177 @@ run_one() {
   local tag="$1" args="$2" seq="$3" total="$4"
   local run_log="$LOG_DIR/${tag}.log"
 
-  log "[P9] [${seq}/${total}] RUN start  ${tag}"
-  ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" ) >"$run_log" 2>&1 || {
-    warn "[P9] RUN FAILED: $tag"
-    warn "[P9] Log file: $run_log"
+  log "[P4] [${seq}/${total}] RUN start  ${tag}"
+
+  (
+    cd "$NS3_DIR"
+
+    local -a cmd
+    if use_no_build; then
+      cmd=( ./ns3 run --no-build "${SCENARIO} ${args}" )
+    else
+      cmd=( ./ns3 run "${SCENARIO} ${args}" )
+    fi
+
+    if have_cpulimit; then
+      cpulimit -l "$CPU_LIMIT_PER_JOB" -- \
+        nice -n "$NICE_LVL" ionice -c"$IONICE_CLASS" -n"$IONICE_PRIO" \
+        "${cmd[@]}"
+    else
+      nice -n "$NICE_LVL" ionice -c"$IONICE_CLASS" -n"$IONICE_PRIO" \
+        "${cmd[@]}"
+    fi
+  ) >"$run_log" 2>&1 || {
+    warn "[P4] RUN FAILED: $tag"
+    warn "[P4] Log file: $run_log"
     tail -n "$TAIL_LINES" "$run_log" || true
     return 1
   }
-  log "[P9] [${seq}/${total}] RUN ok     ${tag}"
+
+  log "[P4] [${seq}/${total}] RUN ok     ${tag}"
   return 0
 }
 
-init_master_from_first() {
-  local master="$1" pattern="$2" default_header="$3"
-  local first
-  first="$(find "$TMP_ROOT" -type f -path "$pattern" | sort | head -n 1 || true)"
-  if [[ -n "${first:-}" && -s "$first" ]]; then
-    head -n 1 "$first" > "$master"
-  else
-    echo "$default_header" > "$master"
-  fi
+init_master_csv() {
+  mkdir -p "$(dirname "$CSV_OUT")"
+  echo "$CSV_HEADER" > "$CSV_OUT"
 }
 
-merge_csv_family() {
-  local master="$1" pattern="$2" default_header="$3"
-  init_master_from_first "$master" "$pattern" "$default_header"
+merge_matrix_csv() {
+  init_master_csv
 
-  local f
+  local f first
   while IFS= read -r f; do
     [[ -s "$f" ]] || continue
-    tail -n +2 "$f" >> "$master" || true
-  done < <(find "$TMP_ROOT" -type f -path "$pattern" | sort)
+    first="$(head -n 1 "$f" || true)"
+    if [[ "$first" == "$CSV_HEADER" ]] || [[ "$first" == distance,channelWidth,* ]]; then
+      tail -n +2 "$f" >> "$CSV_OUT" || true
+    else
+      cat "$f" >> "$CSV_OUT" || true
+    fi
+  done < <(find "$TMP_ROOT" -type f -path "*/raw/p4_matrix.csv" | sort)
 
-  log "[P9] Merge done -> $master"
+  log "[P4] Merge done -> $CSV_OUT"
 }
 
-maybe_plot() {
-  [[ "$PLOT" == "true" ]] || return 0
-  [[ -f "$PLOT_SCRIPT" ]] || { warn "[P9] PLOT=true but plot script not found: $PLOT_SCRIPT"; return 0; }
-  log "[P9] Plotting with $PLOT_SCRIPT"
-  python3 "$PLOT_SCRIPT" "$RAW_DIR/grid.csv" "$PLOT_DIR" >"$LOG_DIR/plot_p9.log" 2>&1 || \
-    warn "[P9] Plot failed (see $LOG_DIR/plot_p9.log)"
+copy_per_run_raw() {
+  local dst="$RAW_DIR/per_run_raw"
+  mkdir -p "$dst"
+
+  local d
+  while IFS= read -r d; do
+    local tag
+    tag="$(basename "$d")"
+    mkdir -p "$dst/$tag"
+    if [[ -d "$d/raw" ]]; then
+      cp -a "$d/raw/." "$dst/$tag/" 2>/dev/null || true
+    fi
+  done < <(find "$TMP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
 }
 
+# -------------------- main --------------------
 main() {
-  # Safe cap
   if (( JOBS > MAX_JOBS )); then JOBS="$MAX_JOBS"; fi
   if (( JOBS < 1 )); then JOBS=1; fi
+  if (( BUILD_JOBS < 1 )); then BUILD_JOBS=1; fi
 
   ensure_dirs
   if [[ "$CLEAN" == "true" ]]; then
     clean_outputs
-  else
-    log "[P9] CLEAN disabled"
   fi
   mkdir -p "$TMP_ROOT"
 
   stage_scenario
   build_ns3
 
-  log "[P9] Parallel runs: JOBS=$JOBS (8 cores tuned)."
-  log "[P9] UDPRATE=$UDPRATE Mbps"
-
-  # Total points
-  local total idx fail
-  fail=0; idx=0
-  if [[ -n "$POINTS" ]]; then
-    IFS=',' read -r -a pts <<< "$POINTS"
-    total="${#pts[@]}"
+  log "[P4] simTime=${SIM_TIME}s appStart=${APP_START}s seed=${SEED} jobs=${JOBS} buildJobs=${BUILD_JOBS}"
+  if have_cpulimit; then
+    log "[P4] cpulimit enabled: per-job=${CPU_LIMIT_PER_JOB}% (reduce to cool down)"
   else
-    local nx=$(( (X_MAX - X_MIN) / STEP + 1 ))
-    local ny=$(( (Y_MAX - Y_MIN) / STEP + 1 ))
-    total=$(( nx * ny ))
+    log "[P4] cpulimit not found (optional). nice/ionice enabled."
   fi
+  [[ -n "${EXTRA_ARGS}" ]] && log "[P4] EXTRA_ARGS=${EXTRA_ARGS}"
+  [[ -n "${CASES}" ]] && log "[P4] CASES provided (manual list)"
 
-  if [[ -n "$POINTS" ]]; then
-    for p in "${pts[@]}"; do
-      local px="${p%%:*}"
-      local py="${p#*:}"
-      local runnum=$((RUN_BASE + idx))
-      local seq=$((idx + 1))
-      local tag="p9_$(safe_tag "$px" "$py")_run${runnum}"
-
-      local out_run="$TMP_ROOT/$tag"
-      mkdir -p "$out_run/heatmaps" "$out_run/raw"
-
-      local args; args="$(common_args "$out_run" "$runnum" "$px" "$py")"
-      run_one "$tag" "$args" "$seq" "$total" || { fail=$((fail + 1)); [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && break; } &
-      wait_for_slot
-      idx=$((idx + 1))
-    done
+  # Build run list
+  local -a runs=()
+  if [[ -n "${CASES}" ]]; then
+    IFS=',' read -r -a runs <<< "$CASES"
   else
-    for ((xx=X_MIN; xx<=X_MAX; xx+=STEP)); do
-      for ((yy=Y_MIN; yy<=Y_MAX; yy+=STEP)); do
-        local runnum=$((RUN_BASE + idx))
-        local seq=$((idx + 1))
-        local tag="p9_$(safe_tag "$xx" "$yy")_run${runnum}"
-
-        local out_run="$TMP_ROOT/$tag"
-        mkdir -p "$out_run/heatmaps" "$out_run/raw"
-
-        local args; args="$(common_args "$out_run" "$runnum" "$xx" "$yy")"
-        run_one "$tag" "$args" "$seq" "$total" || { fail=$((fail + 1)); [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && break; } &
-        wait_for_slot
-        idx=$((idx + 1))
+    local d w p mode mcs
+    for d in "${DISTANCES[@]}"; do
+      for w in "${WIDTHS[@]}"; do
+        for p in "${TXPOWERS[@]}"; do
+          for mode in "${RATEMODES[@]}"; do
+            if [[ "$mode" == "adaptive" ]]; then
+              runs+=( "${d}:${w}:${p}:${mode}:0" )
+            else
+              for mcs in "${MCS_LIST[@]}"; do
+                runs+=( "${d}:${w}:${p}:${mode}:${mcs}" )
+              done
+            fi
+          done
+        done
       done
-      [[ "$STOP_ON_FIRST_FAIL" == "true" && "$fail" -ne 0 ]] && break
     done
   fi
+
+  local total="${#runs[@]}"
+  log "[P4] Total runs=${total}"
+
+  local idx=0 fail=0
+  for item in "${runs[@]}"; do
+    local d="${item%%:*}"
+    local rest="${item#*:}"
+    local w="${rest%%:*}"; rest="${rest#*:}"
+    local p="${rest%%:*}"; rest="${rest#*:}"
+    local mode="${rest%%:*}"
+    local mcs="${rest##*:}"
+
+    local runnum=$((RUN_BASE + idx))
+    local seq=$((idx + 1))
+
+    local tag
+    tag="$(safe_tag "$d" "$w" "$p" "$mode" "$mcs" "$SEED" "$runnum")"
+
+    local out_run="$TMP_ROOT/$tag"
+    mkdir -p "$out_run/raw" "$out_run/logs" "$out_run/plots"
+
+    local args
+    args="$(common_args "$out_run" "$d" "$w" "$p" "$mode" "$mcs" "$runnum")"
+
+    run_one "$tag" "$args" "$seq" "$total" || {
+      fail=$((fail + 1))
+      [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && break
+    } &
+
+    sleep "$START_STAGGER_S"
+    wait_for_slot
+    idx=$((idx + 1))
+  done
 
   wait || true
 
-  # Merge heatmap.csv (optional extra file)
-  merge_csv_family \
-    "$HEAT_DIR/heatmap.csv" \
-    "*/heatmaps/heatmap.csv" \
-    "x,y,associated,offered_mbps,goodput_mbps,avg_rtt_ms,rtt_replies,tx_bytes,rx_bytes,loss_ratio,rssi_est_dbm,snr_est_db,seed,run,standard,transport,rateControl,channelWidth"
+  merge_matrix_csv
+  copy_per_run_raw
 
-  # Merge REQUIRED grid.csv for the project :contentReference[oaicite:3]{index=3}
-  merge_csv_family \
-    "$RAW_DIR/grid.csv" \
-    "*/raw/grid.csv" \
-    "x,y,seed,run,rssi_dbm,snr_db,goodput_mbps,rtt_ms,delay_ms,loss"
+  if [[ "$KEEP_TMP" != "true" ]]; then
+    rm -rf "$TMP_ROOT" || true
+  else
+    log "[P4] KEEP_TMP=true (tmp runs kept at: $TMP_ROOT)"
+  fi
 
-  maybe_plot
-
-  # Keep only required dirs
-  rm -rf "$TMP_ROOT" || true
-
-  log "[P9] Outputs kept:"
-  log "  heatmaps: $HEAT_DIR"
-  log "  raw     : $RAW_DIR"
-  log "  logs    : $LOG_DIR"
-  log "  plots   : $PLOT_DIR"
+  log "[P4] Outputs:"
+  log "  raw   : $RAW_DIR"
+  log "  logs  : $LOG_DIR"
+  log "  plots : $PLOT_DIR"
+  log "  merged: $CSV_OUT"
+  log "  per-run raw: $RAW_DIR/per_run_raw/"
 
   if [[ "$fail" -ne 0 ]]; then
-    die "[P9] Completed with failures: $fail (see $LOG_DIR)"
+    die "[P4] Completed with failures: $fail (see $LOG_DIR)"
   fi
-  log "[P9] All points completed successfully."
+  log "[P4] All runs completed successfully."
 }
 
 main "$@"

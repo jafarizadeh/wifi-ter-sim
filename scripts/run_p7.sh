@@ -1,386 +1,244 @@
 #!/usr/bin/env bash
-# scripts/run_p7.sh
-#
-# Projet 7 (ns-3) runner - professional, reproducible, and robust.
-#
-# What this script does:
-#  1) Cleans previous outputs (default).
-#  2) Copies (stages) the scenario source into ns-3 scratch/.
-#  3) Builds ns-3 (quiet by default, logs to results/p7/logs/build.log).
-#  4) Runs the required experiment matrix:
-#        channelPlan ∈ {cocanal, separe}
-#        nStaPerCell ∈ {2, 5, 10}
-#     with deterministic seed/run ids.
-#  5) Verifies that required output files exist.
-#  6) Prints a concise summary: where files were created.
-#  7) Validates the mandatory condition:
-#        For N=10, goodputTotal(cocanal) <= goodputTotal(separe)
-#
-# Usage:
-#   chmod +x scripts/run_p7.sh
-#   ./scripts/run_p7.sh
-#
-# Common overrides (examples):
-#   NS3_DIR=~/ns-3 OUTDIR=results/p7 ./scripts/run_p7.sh
-#   CLEAN=false QUIET_RUN=false ./scripts/run_p7.sh
-#   STOP_ON_FIRST_FAIL=true ./scripts/run_p7.sh
+# Projet 7 runner (parallel, safe merging)
+# ns-3 scenario: p7_channel_planning (co-channel vs separate)
+# Strategy:
+#  - Clean outputs
+#  - Stage scenario into ns-3 scratch/
+#  - Build ns-3
+#  - Execute runs in parallel (JOBS)
+#  - Each run writes into a private tmp outDir to avoid concurrent writes
+#  - Merge per-run CSVs into final results (summary + per-flow)
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# ---------------------------- Defaults / Config ----------------------------
+# ---------------------------- Paths ----------------------------
 NS3_DIR="${NS3_DIR:-$HOME/ns-3}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Scenario source in your repo + target name in ns-3 scratch/
 SCEN_SRC="${SCEN_SRC:-$ROOT_DIR/scenarios/p7_channel_planning.cc}"
 SCEN_NAME="${SCEN_NAME:-p7_channel_planning}"
-SCENARIO="${SCENARIO:-scratch/${SCEN_NAME}}"
+SCENARIO="scratch/${SCEN_NAME}"
 
-# Output folder (inside your repo)
 OUTDIR="${OUTDIR:-$ROOT_DIR/results/p7}"
+RAW_DIR="$OUTDIR/raw"
+LOG_DIR="$OUTDIR/logs"
+PLOT_DIR="$OUTDIR/plots"
+TMP_ROOT="$OUTDIR/tmp_runs"
 
-# Simulation settings
-SIMTIME="${SIMTIME:-25}"
-APPSTART="${APPSTART:-2}"
-APSEP="${APSEP:-15}"
-RSTA="${RSTA:-5}"
+# ---------------------------- Parallelism ----------------------------
+JOBS="${JOBS:-6}"
+MAX_JOBS="${MAX_JOBS:-8}"
 
-# Traffic settings
-PKTSIZE="${PKTSIZE:-1200}"
-UDPRATE="${UDPRATE:-10Mbps}"
-
-# Channel planning settings
+# ---------------------------- Matrix ----------------------------
+NSTAS="${NSTAS:-2,5,10}"
 CHAN1="${CHAN1:-36}"
 CHAN2="${CHAN2:-40}"
-CHWIDTH="${CHWIDTH:-20}"
+WIDTH="${WIDTH:-20}"
 
-# Realism knobs (must match your C++ CLI options)
-TXPWR="${TXPWR:-16}"
-NOISEFIG="${NOISEFIG:-7}"
-LOGEXP="${LOGEXP:-3.0}"
-SHADOWSIG="${SHADOWSIG:-4.0}"
-FADING="${FADING:-true}"
-
-# Extra outputs
-PCAP="${PCAP:-false}"
-FLOWMON="${FLOWMON:-true}"
-
-# Reproducibility
 SEED="${SEED:-1}"
 RUN_BASE="${RUN_BASE:-1}"
 
-# Required matrix for Projet 7
-NSTAS=(2 5 10)
-PLANS=(cocanal separe)
+# ---------------------------- Defaults (match C++ CLI) ----------------------------
+PCAP="${PCAP:-false}"
+FLOWMON="${FLOWMON:-true}"
 
-# Behavior toggles
-CLEAN="${CLEAN:-true}"                      # Clean old outputs first (default true)
-STOP_ON_FIRST_FAIL="${STOP_ON_FIRST_FAIL:-false}"
-QUIET_BUILD="${QUIET_BUILD:-true}"          # Build output to build.log only
-QUIET_RUN="${QUIET_RUN:-true}"              # Run output to per-run log only
-TAIL_LINES="${TAIL_LINES:-180}"             # Tail lines shown on failure
-VALIDATE="${VALIDATE:-true}"                # Validate N=10 constraint
-SHOW_N10_TOTALS="${SHOW_N10_TOTALS:-true}"  # Print N=10 totals in Mbps
+SIMTIME="${SIMTIME:-25}"
+APPSTART="${APPSTART:-2}"
+
+AP_SEP="${AP_SEP:-15}"
+R_STA="${R_STA:-5}"
+
+PKTSIZE="${PKTSIZE:-1200}"
+UDP_RATE_PER_STA="${UDP_RATE_PER_STA:-10Mbps}"
+
+TXPWR="${TXPWR:-16}"
+NOISEFIG="${NOISEFIG:-7}"
+LOGEXP="${LOGEXP:-3.0}"
+SHADOW_SIGMA="${SHADOW_SIGMA:-4.0}"
+ENABLE_FADING="${ENABLE_FADING:-true}"
+
+ENABLE_WIFI_LOGS="${ENABLE_WIFI_LOGS:-false}"
+WIFI_LOG_LEVEL="${WIFI_LOG_LEVEL:-INFO}"
+ENABLE_PREFIXES="${ENABLE_PREFIXES:-true}"
+ENABLE_ASSOC_LOGS="${ENABLE_ASSOC_LOGS:-false}"
 
 # ---------------------------- Helpers ----------------------------
-ts() { date +"%Y-%m-%d %H:%M:%S"; }
-log() { echo "[$(ts)] $*"; }
-warn() { echo "[$(ts)] WARN: $*" >&2; }
-die() { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
+ts(){ date +"%Y-%m-%d %H:%M:%S"; }
+log(){ echo "[$(ts)] $*"; }
+warn(){ echo "[$(ts)] WARN: $*" >&2; }
+die(){ echo "[$(ts)] ERROR: $*" >&2; exit 1; }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 
-ensure_dirs() {
-  mkdir -p "$OUTDIR/raw" "$OUTDIR/logs" "$OUTDIR/plots"
-}
+ensure_dirs(){ mkdir -p "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT"; }
 
-clean_outputs() {
+clean_outputs(){
   log "[P7] Cleaning previous outputs under: $OUTDIR"
-  rm -f "$OUTDIR/raw/p7_summary.csv" || true
-  rm -f "$OUTDIR/raw/perflow_"*.csv || true
-  rm -f "$OUTDIR/raw/flowmon_"*.xml || true
-  rm -f "$OUTDIR/raw/pcap_"*.pcap || true
-  rm -f "$OUTDIR/logs/"*.log "$OUTDIR/logs/build.log" || true
+  rm -rf "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT" || true
+  ensure_dirs
 }
 
-stage_scenario() {
+stage_scenario(){
   [[ -d "$NS3_DIR" ]] || die "NS3_DIR not found: $NS3_DIR"
   [[ -f "$SCEN_SRC" ]] || die "Scenario source not found: $SCEN_SRC"
-
   local dst="$NS3_DIR/scratch/${SCEN_NAME}.cc"
+  mkdir -p "$NS3_DIR/scratch"
   cp -f "$SCEN_SRC" "$dst" || die "Copy to ns-3 scratch failed: $dst"
   log "[P7] Staged scenario: $SCEN_SRC -> $dst"
 }
 
-build_ns3() {
-  log "[P7] Building ns-3 in: $NS3_DIR"
-  local build_log="$OUTDIR/logs/build.log"
-
-  if [[ "$QUIET_BUILD" == "true" ]]; then
-    ( cd "$NS3_DIR" && ./ns3 build ) >"$build_log" 2>&1 || {
-      echo
-      warn "[P7] BUILD FAILED. Showing last ${TAIL_LINES} lines from $build_log"
-      tail -n "$TAIL_LINES" "$build_log" || true
-      die "ns-3 build failed (full log: $build_log)"
-    }
-  else
-    ( cd "$NS3_DIR" && ./ns3 build ) || die "ns-3 build failed"
-    : >"$build_log" || true
-  fi
-
+build_ns3(){
+  log "[P7] Building ns-3"
+  local build_log="$LOG_DIR/build.log"
+  ( cd "$NS3_DIR" && ./ns3 build --jobs="$MAX_JOBS" ) >"$build_log" 2>&1 || {
+    tail -n 200 "$build_log" || true
+    die "ns-3 build failed (see $build_log)"
+  }
   log "[P7] Build OK"
 }
 
-run_one() {
-  local plan="$1"
-  local nsta="$2"
-  local runnum="$3"
-  local seq="$4"
-  local total="$5"
+safe_tag(){
+  local s="$1"
+  s="${s// /_}"; s="${s//:/_}"; s="${s//,/_}"
+  echo "$s"
+}
 
-
-  local tag="${plan}_n${nsta}_run${runnum}"
-  local log_path="$OUTDIR/logs/${tag}.log"
-
-  # ✅ FIX: For cocanal, force chan2=chan1 so both cells are truly co-channel (and CSV reflects it)
-  local chan2_eff="$CHAN2"
-  if [[ "$plan" == "cocanal" ]]; then
-    chan2_eff="$CHAN1"
-  fi
-
-  local args="\
---outDir=${OUTDIR} \
+common_args(){
+  local out="$1" run="$2" plan="$3" n="$4" c1="$5" c2="$6" w="$7"
+  echo "\
 --simTime=${SIMTIME} --appStart=${APPSTART} \
---nStaPerCell=${nsta} \
---apSeparation=${APSEP} --rSta=${RSTA} \
---pktSize=${PKTSIZE} --udpRatePerSta=${UDPRATE} \
---channelPlan=${plan} --chan1=${CHAN1} --chan2=${chan2_eff} --channelWidth=${CHWIDTH} \
+--nStaPerCell=${n} \
+--ssid1=cell1 --ssid2=cell2 \
+--outDir=${out} --pcap=${PCAP} --flowmon=${FLOWMON} \
+--apSeparation=${AP_SEP} --rSta=${R_STA} \
+--pktSize=${PKTSIZE} --udpRatePerSta=${UDP_RATE_PER_STA} \
+--channelPlan=${plan} --chan1=${c1} --chan2=${c2} --channelWidth=${w} \
 --txPowerDbm=${TXPWR} --noiseFigureDb=${NOISEFIG} \
---logExp=${LOGEXP} --shadowingSigmaDb=${SHADOWSIG} --enableFading=${FADING} \
---pcap=${PCAP} --flowmon=${FLOWMON} \
---seed=${SEED} --run=${runnum}"
+--logExp=${LOGEXP} --shadowingSigmaDb=${SHADOW_SIGMA} --enableFading=${ENABLE_FADING} \
+--seed=${SEED} --run=${run} \
+--enableWifiLogs=${ENABLE_WIFI_LOGS} --wifiLogLevel=${WIFI_LOG_LEVEL} \
+--enableLogPrefixes=${ENABLE_PREFIXES} --enableAssocManagerLogs=${ENABLE_ASSOC_LOGS}"
+}
 
-log "[P7] [${seq}/${total}] RUN start  plan=${plan}  nStaPerCell=${nsta}  run=${runnum} (chan1=${CHAN1}, chan2=${chan2_eff})"
-
-  if [[ "$QUIET_RUN" == "true" ]]; then
-    ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" ) >"$log_path" 2>&1 || {
-      echo
-      warn "[P7] RUN FAILED: $tag"
-      warn "[P7] Log file: $log_path"
-      warn "[P7] Last ${TAIL_LINES} lines:"
-      tail -n "$TAIL_LINES" "$log_path" || true
-      return 1
-    }
-  else
-    ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" ) | tee "$log_path" || {
-      echo
-      warn "[P7] RUN FAILED: $tag"
-      warn "[P7] Log file: $log_path"
-      return 1
-    }
-  fi
-
-log "[P7] [${seq}/${total}] RUN ok     plan=${plan}  nStaPerCell=${nsta}  run=${runnum}"
+run_one(){
+  local tag="$1" args="$2" seq="$3" total="$4"
+  local run_log="$LOG_DIR/${tag}.log"
+  log "[P7] [${seq}/${total}] RUN start  ${tag}"
+  ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" ) >"$run_log" 2>&1 || {
+    warn "[P7] RUN FAILED: ${tag} (see $run_log)"
+    return 1
+  }
+  log "[P7] [${seq}/${total}] RUN ok     ${tag}"
   return 0
 }
 
-exists_ok() {
-  local path="$1"
-  if [[ -s "$path" ]]; then
-    echo "OK   $path"
-    return 0
-  fi
-  echo "MISS $path"
-  return 1
-}
-
-# Print a sorted list of files matching pattern (relative to OUTDIR)
-list_files() {
-  local title="$1"
-  local pattern="$2"
-
-  echo
-  echo "$title"
-
-  local files
-  files="$(find "$OUTDIR" -maxdepth 2 -type f -name "$pattern" 2>/dev/null | sort || true)"
-  if [[ -n "$files" ]]; then
-    printf '%s\n' "$files"
+init_master_from_first(){
+  local master="$1" pattern="$2" default_header="$3"
+  local first
+  first="$(find "$TMP_ROOT" -type f -path "$pattern" | sort | head -n 1 || true)"
+  if [[ -n "${first:-}" && -s "$first" ]]; then
+    head -n 1 "$first" > "$master"
   else
-    echo "NONE"
+    echo "$default_header" > "$master"
   fi
 }
 
-# Extract goodputTotal from p7_summary.csv for (plan, nStaPerCell)
-# CSV format:
-# channelPlan,nStaPerCell,chan1,chan2,seed,run,goodputCell1,goodputCell2,goodputTotal,jainCells
-extract_goodput_total() {
-  local plan="$1"
-  local nsta="$2"
-  local csv="$OUTDIR/raw/p7_summary.csv"
-  [[ -f "$csv" ]] || return 1
-
-  awk -F',' -v p="$plan" -v n="$nsta" '
-    NR==1 { next }         # skip header
-    $1==p && $2==n { val=$9 }
-    END {
-      if (val=="") exit 1;
-      printf "%.10f\n", val;
-    }
-  ' "$csv"
+merge_csv(){
+  local master="$1" pattern="$2" default_header="$3"
+  init_master_from_first "$master" "$pattern" "$default_header"
+  local f
+  while IFS= read -r f; do
+    [[ -s "$f" ]] || continue
+    tail -n +2 "$f" >> "$master" || true
+  done < <(find "$TMP_ROOT" -type f -path "$pattern" | sort)
+  log "[P7] Merge -> $master"
 }
 
-validate_n10_condition() {
-  local nsta=10
-  local g_cocanal g_separe
-
-  g_cocanal="$(extract_goodput_total "cocanal" "$nsta" || true)"
-  g_separe="$(extract_goodput_total "separe" "$nsta" || true)"
-
-  if [[ -z "${g_cocanal:-}" || -z "${g_separe:-}" ]]; then
-    warn "[P7] Validation skipped: could not parse goodputTotal for N=10 from p7_summary.csv"
-    return 1
-  fi
-
-  # Compare floats using awk
-  local ok
-  ok="$(awk -v a="$g_cocanal" -v b="$g_separe" 'BEGIN{ if (a<=b+1e-9) print "1"; else print "0"; }')"
-  if [[ "$ok" != "1" ]]; then
-    echo
-    warn "[P7] VALIDATION FAILED (N=10): cocanal goodputTotal > separe"
-    warn "  cocanal goodputTotal = $g_cocanal bps"
-    warn "  separe  goodputTotal = $g_separe bps"
-    warn "Possible causes:"
-    warn "  - Channels not truly separated (check code: separate must use distinct YansWifiChannel objects)."
-    warn "  - Cells too far / weak interference (apSeparation, rSta, TxPower, propagation)."
-    warn "  - Different PHY settings between runs."
-    return 1
-  fi
-
-  log "[P7] Validation OK (N=10): cocanal goodputTotal <= separe"
-
-  if [[ "$SHOW_N10_TOTALS" == "true" ]]; then
-    local mc ms ratio
-    mc="$(awk -v x="$g_cocanal" 'BEGIN{printf "%.3f", x/1e6}')"
-    ms="$(awk -v x="$g_separe"  'BEGIN{printf "%.3f", x/1e6}')"
-    ratio="$(awk -v a="$g_cocanal" -v b="$g_separe" 'BEGIN{ if (b>0) printf "%.3f", a/b; else print "nan"; }')"
-    log "[P7] N=10 totals: cocanal=${mc} Mbps, separe=${ms} Mbps (ratio=${ratio})"
-  fi
-
-  return 0
-}
-
-report_outputs() {
-  echo
-  echo "====================== [P7] Summary ======================"
-  echo "OutDir: $OUTDIR"
-  echo "Logs : $OUTDIR/logs"
-  echo "Raw  : $OUTDIR/raw"
-  echo "----------------------------------------------------------"
-  echo "[P7] Required files check:"
-
-  exists_ok "$OUTDIR/raw/p7_summary.csv" || true
-
-  # Reconstruct expected file names using the same run numbering logic
-  local IDX=0
-  for plan in "${PLANS[@]}"; do
-    for nsta in "${NSTAS[@]}"; do
-      local runnum=$((RUN_BASE + IDX))
-      exists_ok "$OUTDIR/raw/perflow_${plan}_n${nsta}_run${runnum}.csv" || true
-      if [[ "$FLOWMON" == "true" ]]; then
-        exists_ok "$OUTDIR/raw/flowmon_${plan}_n${nsta}_run${runnum}.xml" || true
-      fi
-      IDX=$((IDX + 1))
-    done
-  done
-
-  list_files "[P7] Generated per-flow CSVs:" "perflow_*.csv"
-  [[ "$FLOWMON" == "true" ]] && list_files "[P7] Generated FlowMonitor XMLs:" "flowmon_*.xml"
-  [[ "$PCAP" == "true" ]] && list_files "[P7] Generated PCAPs:" "pcap_*.pcap"
-  list_files "[P7] Run logs:" "*.log"
-
-  echo "=========================================================="
-}
-
-usage() {
-  cat <<EOF
-Usage: ./scripts/run_p7.sh
-
-Environment overrides (examples):
-  NS3_DIR=~/ns-3 OUTDIR=results/p7 CLEAN=true ./scripts/run_p7.sh
-  QUIET_RUN=false ./scripts/run_p7.sh
-  STOP_ON_FIRST_FAIL=true ./scripts/run_p7.sh
-
-Key toggles:
-  CLEAN=true|false              (default: true)
-  QUIET_BUILD=true|false        (default: true)
-  QUIET_RUN=true|false          (default: true)
-  STOP_ON_FIRST_FAIL=true|false (default: false)
-  VALIDATE=true|false           (default: true)
-EOF
+copy_perflow_files(){
+  mkdir -p "$RAW_DIR/perflow"
+  find "$TMP_ROOT" -type f -name "perflow_*.csv" -exec cp -f {} "$RAW_DIR/perflow/" \; || true
 }
 
 # ---------------------------- Main ----------------------------
-main() {
-  need_cmd awk
+main(){
   need_cmd find
   need_cmd tail
-  need_cmd sort
 
-  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    usage
-    exit 0
-  fi
+  # concurrency bounds
+  (( JOBS > MAX_JOBS )) && JOBS="$MAX_JOBS"
+  (( JOBS < 1 )) && JOBS=1
 
-  ensure_dirs
-
-  # Always clean by default (per your requirement).
-  if [[ "$CLEAN" == "true" ]]; then
-    clean_outputs
-  else
-    log "[P7] CLEAN disabled; existing outputs may be overwritten/appended"
-  fi
-
+  clean_outputs
   stage_scenario
   build_ns3
 
-  local FAIL=0
-  local IDX=0
-    local TOTAL_RUNS=$(( ${#PLANS[@]} * ${#NSTAS[@]} ))
+  IFS=',' read -r -a nstas_arr <<< "$NSTAS"
+  plans=( "cocanal" "separe" )
 
+  # total runs for progress
+  local total=$(( ${#nstas_arr[@]} * ${#plans[@]} ))
+  local idx=0
+  local running=0
+  local fail=0
 
-  # Run the experiment matrix
-  for plan in "${PLANS[@]}"; do
-    for nsta in "${NSTAS[@]}"; do
-      local runnum=$((RUN_BASE + IDX))
-      local SEQ=$((IDX + 1))
-      if ! run_one "$plan" "$nsta" "$runnum" "$SEQ" "$TOTAL_RUNS"; then
-        FAIL=$((FAIL + 1))
-        if [[ "$STOP_ON_FIRST_FAIL" == "true" ]]; then
-          report_outputs
-          die "[P7] Aborting on first failure (see logs in $OUTDIR/logs/)"
+  for n in "${nstas_arr[@]}"; do
+    for plan in "${plans[@]}"; do
+      idx=$((idx+1))
+      local runnum=$((RUN_BASE + idx - 1))
+      local c1="$CHAN1"
+      local c2="$CHAN1"
+      [[ "$plan" == "separe" ]] && c2="$CHAN2"
+
+      local tag="p7_${plan}_n${n}_c${c1}-${c2}_w${WIDTH}_run${runnum}"
+      local out_run="$TMP_ROOT/$tag"
+      mkdir -p "$out_run/raw" "$out_run/logs" "$out_run/plots"
+
+      local args; args="$(common_args "$out_run" "$runnum" "$plan" "$n" "$c1" "$c2" "$WIDTH")"
+
+      run_one "$(safe_tag "$tag")" "$args" "$idx" "$total" &
+      running=$((running+1))
+
+      if (( running >= JOBS )); then
+        if wait -n; then
+          running=$((running-1))
+        else
+          fail=$((fail+1))
+          running=$((running-1))
         fi
       fi
-      IDX=$((IDX + 1))
     done
   done
 
-  # Post-run verification + summary
-  report_outputs
-
-  # Validate mandatory condition (spec requirement)
-  if [[ "$VALIDATE" == "true" ]]; then
-    if ! validate_n10_condition; then
-      FAIL=$((FAIL + 1))
+  # wait remaining
+  while (( running > 0 )); do
+    if wait -n; then
+      running=$((running-1))
+    else
+      fail=$((fail+1))
+      running=$((running-1))
     fi
-  fi
+  done
 
-  if [[ $FAIL -ne 0 ]]; then
-    die "[P7] Completed with failures: $FAIL (see $OUTDIR/logs/)"
-  fi
+  # merge summary and per-flow
+  merge_csv \
+    "$RAW_DIR/p7_summary.csv" \
+    "*/raw/p7_summary.csv" \
+    "channelPlan,nStaPerCell,chan1,chan2,seed,run,goodputCell1,goodputCell2,goodputTotal,jainCells"
 
-  log "[P7] All runs completed successfully."
+  # optional consolidated perflow_all.csv
+  merge_csv \
+    "$RAW_DIR/perflow_all.csv" \
+    "*/raw/perflow_*.csv" \
+    "cellId,staId,rxBytes,goodputbps"
+
+  copy_perflow_files
+
+  # cleanup tmp
+  rm -rf "$TMP_ROOT" || true
+
+  log "[P7] Completed. Summary: $RAW_DIR/p7_summary.csv"
+  (( fail == 0 )) || die "[P7] One or more runs failed (see $LOG_DIR)"
 }
 
 main "$@"

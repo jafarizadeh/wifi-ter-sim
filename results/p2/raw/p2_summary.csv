@@ -1,2 +1,0 @@
-transport,simTime,appStart,distance,pktSize,udpRate,tcpMaxBytes,seed,run,rxBytes,goodputbps
-udp,20,2,5,1200,50Mbps,0,1,1,15799200,7.02187e+06

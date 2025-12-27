@@ -1,2 +1,0 @@
-distance,channelWidth,txPowerDbm,rateMode,mcs,udpRate,pktSize,seed,run,rxBytes,goodputMbps,rttMeanMs
-5,40,20,adaptive,0,600Mbps,1200,1,12,463477200,205.989867,22.917

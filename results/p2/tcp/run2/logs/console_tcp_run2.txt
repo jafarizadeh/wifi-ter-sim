@@ -1,7 +1,0 @@
-[0/2] Re-checking globbed directories...
-ninja: no work to do.
-[0/2] Re-checking globbed directories...
-ninja: no work to do.
-=== Part 2 terminé ===
-transport=tcp serverIp=10.2.0.2 rxBytes=5084496 goodputbps=2.25978e+06
-CSV: /home/lord/wifi-ter-sim/results/p2/tcp/run2/raw/throughput_timeseries.csv , /home/lord/wifi-ter-sim/results/p2/tcp/run2/raw/rtt_timeseries.csv , /home/lord/wifi-ter-sim/results/p2/tcp/run2/raw/p2_summary.csv

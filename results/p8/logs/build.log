@@ -1,5 +1,0 @@
-[0/2] Re-checking globbed directories...
-[1/2] Building CXX object scratch/CMakeFiles/scratch_p8_qos_wmm.dir/p8_qos_wmm.cc.o
-[2/2] Linking CXX executable /home/lord/ns-3/build/scratch/ns3-dev-p8_qos_wmm-default
-Finished executing the following commands:
-/usr/bin/cmake --build /home/lord/ns-3/cmake-cache -j 7

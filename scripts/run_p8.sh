@@ -1,310 +1,302 @@
 #!/usr/bin/env bash
 # scripts/run_p8.sh
-#
-# Projet 8 (ns-3.41) runner - aligned with your run_p7 style:
-#  1) Clean outputs (default).
-#  2) Stage scenario source into ns-3 scratch/.
-#  3) Build ns-3 (quiet by default, logs to results/p8/logs/build.log).
-#  4) Run experiments with a progress counter like: [1/13]
-#       - baseline: VO+VI only (1 run, BE disabled)
-#       - congestion: OFF + ON at BE_RATE_DEFAULT (2 runs)
-#       - sweep: BE_RATES x {OFF,ON}  (default: 5x2=10 runs)
-#  5) Verify required outputs exist.
-#
-# Usage:
-#   chmod +x scripts/run_p8.sh
-#   ./scripts/run_p8.sh
-#
-# Overrides:
-#   NS3_DIR=~/ns-3 OUTDIR=results/p8 ./scripts/run_p8.sh
-#   CLEAN=false QUIET_RUN=false ./scripts/run_p8.sh
-#   STOP_ON_FIRST_FAIL=true ./scripts/run_p8.sh
-#   SCEN_SRC=./scenarios/p8_qos_wmm.cc ./scripts/run_p8.sh
-#
+#  Part 8 runner (parallel-safe with per-run outDir + merge)
+# Shows run progress like: [1/6]
+
 set -euo pipefail
 IFS=$'\n\t'
 
-# ---------------------------- Defaults / Config ----------------------------
+# -------------------- configuration --------------------
 NS3_DIR="${NS3_DIR:-$HOME/ns-3}"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Scenario source in your repo + target name in ns-3 scratch/
-SCEN_SRC="${SCEN_SRC:-$ROOT_DIR/scenarios/p8_qos_wmm.cc}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 SCEN_NAME="${SCEN_NAME:-p8_qos_wmm}"
+SCEN_SRC="${SCEN_SRC:-$ROOT_DIR/scenarios/${SCEN_NAME}.cc}"
 SCENARIO="${SCENARIO:-scratch/${SCEN_NAME}}"
 
-# Output folder (inside your repo) — IMPORTANT: project folder name is p8
+# مهم: پوشه خروجی باید p8 باشد
 OUTDIR="${OUTDIR:-$ROOT_DIR/results/p8}"
+RAW_DIR="$OUTDIR/raw"
+LOG_DIR="$OUTDIR/logs"
+PLOT_DIR="$OUTDIR/plots"
+TMP_ROOT="$OUTDIR/tmp_runs"
 
-# Common knobs (match the C++ CLI options)
-PCAP="${PCAP:-false}"
-FLOWMON="${FLOWMON:-true}"
-SEED="${SEED:-1}"
-RUN_BASE="${RUN_BASE:-1}"
-DURATION="${DURATION:-30}"
-APPSTART="${APPSTART:-1.0}"
+CSV_OUT="$RAW_DIR/p8_summary.csv"
+CSV_HEADER="mode,beRateMbps,seed,run,goodputBE,goodputVO,goodputVI,delayVO_ms,jitterVO_ms,lossVO,delayVI_ms,jitterVI_ms,lossVI"
 
-# Wi-Fi knobs (match C++ options)
-STANDARD="${STANDARD:-ax}"        # ax|ac|n
-DATAMODE="${DATAMODE:-HeMcs7}"    # for 11ax
-CTRLMODE="${CTRLMODE:-HeMcs0}"
-TXPWR="${TXPWR:-16}"
-CHWIDTH="${CHWIDTH:-20}"
-CHANNELNUM="${CHANNELNUM:-36}"    # if your C++ supports --channelNumber
-
-# Traffic defaults
-VOIP_PKTSIZE="${VOIP_PKTSIZE:-160}"
-VOIP_PPS="${VOIP_PPS:-50}"
-
-VIDEO_PKTSIZE="${VIDEO_PKTSIZE:-1200}"
-VIDEO_RATE_MBPS="${VIDEO_RATE_MBPS:-6}"
-
-BE_PKTSIZE="${BE_PKTSIZE:-1200}"
-BE_RATE_DEFAULT="${BE_RATE_DEFAULT:-40}"
-
-# Sweep rates (comma-separated)
-BE_RATES="${BE_RATES:-0,10,20,40,60}"
-
-# Behavior toggles
 CLEAN="${CLEAN:-true}"
-STOP_ON_FIRST_FAIL="${STOP_ON_FIRST_FAIL:-false}"
-QUIET_BUILD="${QUIET_BUILD:-true}"
-QUIET_RUN="${QUIET_RUN:-true}"
-TAIL_LINES="${TAIL_LINES:-180}"
+KEEP_TMP="${KEEP_TMP:-false}"
 
-# ---------------------------- Helpers ----------------------------
-ts() { date +"%Y-%m-%d %H:%M:%S"; }
-log() { echo "[$(ts)] $*"; }
+# ---- build/parallel knobs ----
+BUILD_JOBS="${BUILD_JOBS:-2}"
+TAIL_LINES="${TAIL_LINES:-120}"
+
+JOBS="${JOBS:-6}"
+MAX_JOBS="${MAX_JOBS:-6}"
+
+LAUNCH_STAGGER_MS="${LAUNCH_STAGGER_MS:-250}"
+
+NICE_LEVEL="${NICE_LEVEL:-15}"
+IONICE_CLASS="${IONICE_CLASS:-2}"
+IONICE_LEVEL="${IONICE_LEVEL:-7}"
+CPULIMIT_PCT="${CPULIMIT_PCT:-10}"
+
+# -------------------- sweep parameters --------------------
+BE_RATES_STR="${BE_RATES:-0 10 20 40 60}"
+MODES_STR="${MODES:-OFF ON}"
+
+DURATION="${DURATION:-30}"
+APP_START="${APP_START:-1}"
+
+SEED="${SEED:-1}"
+RUN_BASE="${RUN_BASE:-0}"
+
+FLOWMON="${FLOWMON:-true}"
+PCAP="${PCAP:-false}"
+VERBOSE_APP="${VERBOSE_APP:-false}"
+
+# Wi-Fi knobs
+STANDARD="${STANDARD:-ax}"
+DATAMODE="${DATAMODE:-HeMcs7}"
+CTRLMODE="${CTRLMODE:-HeMcs0}"
+TXPOWER_DBM="${TXPOWER_DBM:-16}"
+CHANNEL_WIDTH="${CHANNEL_WIDTH:-20}"
+CHANNEL_NUMBER="${CHANNEL_NUMBER:-36}"
+
+# VO/VI/BE knobs
+VO_PKT="${VO_PKT_SIZE:-160}"
+VO_PPS="${VO_PPS:-50}"
+VI_PKT="${VI_PKT_SIZE:-1200}"
+VI_RATE="${VI_RATE_MBPS:-6}"
+BE_PKT="${BE_PKT_SIZE:-1200}"
+
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+# -------------------- helpers --------------------
+ts()   { date +"%Y-%m-%d %H:%M:%S"; }
+log()  { echo "[$(ts)] $*"; }
 warn() { echo "[$(ts)] WARN: $*" >&2; }
-die() { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
+die()  { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-ensure_dirs() {
-  mkdir -p "$OUTDIR/raw" "$OUTDIR/logs" "$OUTDIR/plots" "$OUTDIR/pcap" "$OUTDIR/report"
-}
+ensure_dirs() { mkdir -p "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT"; }
 
 clean_outputs() {
-  log "[P8] Cleaning previous outputs under: $OUTDIR"
-  rm -rf "$OUTDIR/raw" "$OUTDIR/logs" "$OUTDIR/plots" "$OUTDIR/pcap" "$OUTDIR/report" || true
+  log "[P8] Cleaning outputs under: $OUTDIR"
+  rm -rf "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT" || true
   ensure_dirs
-}
-
-init_csv() {
-  local csv="$OUTDIR/raw/p8_summary.csv"
-  echo "mode,beRateMbps,seed,run,goodputBE,goodputVO,goodputVI,delayVO_ms,jitterVO_ms,lossVO,delayVI_ms,jitterVI_ms,lossVI" > "$csv"
-  log "[P8] Initialized CSV: $csv"
 }
 
 stage_scenario() {
   [[ -d "$NS3_DIR" ]] || die "NS3_DIR not found: $NS3_DIR"
   [[ -f "$SCEN_SRC" ]] || die "Scenario source not found: $SCEN_SRC"
-
-  local dst="$NS3_DIR/scratch/${SCEN_NAME}.cc"
-  cp -f "$SCEN_SRC" "$dst" || die "Copy to ns-3 scratch failed: $dst"
-  log "[P8] Staged scenario: $SCEN_SRC -> $dst"
+  mkdir -p "$NS3_DIR/scratch"
+  cp -f "$SCEN_SRC" "$NS3_DIR/scratch/${SCEN_NAME}.cc" || die "Copy to ns-3 scratch failed"
+  log "[P8] Staged scenario: $SCEN_SRC -> $NS3_DIR/scratch/${SCEN_NAME}.cc"
 }
 
-build_ns3() {
-  log "[P8] Building ns-3 in: $NS3_DIR"
-  local build_log="$OUTDIR/logs/build.log"
-
-  if [[ "$QUIET_BUILD" == "true" ]]; then
-    ( cd "$NS3_DIR" && ./ns3 build ) >"$build_log" 2>&1 || {
-      echo
-      warn "[P8] BUILD FAILED. Showing last ${TAIL_LINES} lines from $build_log"
-      tail -n "$TAIL_LINES" "$build_log" || true
-      die "ns-3 build failed (full log: $build_log)"
-    }
-  else
-    ( cd "$NS3_DIR" && ./ns3 build ) || die "ns-3 build failed"
-    : >"$build_log" || true
-  fi
-
+build_ns3_low_heat() {
+  log "[P8] Building ns-3 (low-heat): -j${BUILD_JOBS}"
+  local build_log="$LOG_DIR/build.log"
+  ( cd "$NS3_DIR" && NINJAFLAGS="-j${BUILD_JOBS}" ./ns3 build ) >"$build_log" 2>&1 || {
+    warn "[P8] BUILD FAILED. Last ${TAIL_LINES} lines:"
+    tail -n "$TAIL_LINES" "$build_log" || true
+    die "ns-3 build failed (full log: $build_log)"
+  }
   log "[P8] Build OK"
 }
 
-run_ns3() {
-  local tag="$1"
-  local args="$2"
-  local seq="$3"
-  local total="$4"
+to_array() {
+  local s="$1"
+  local -n out="$2"
+  local IFS=' '
+  read -r -a out <<< "$s"
+}
 
-  # Ensure tag is filesystem-safe (no spaces)
-  tag="${tag// /_}"
-  local log_path="$OUTDIR/logs/${tag}.log"
+run_cmd_wrapped() {
+  local run_log="$1"; shift
+  local -a cmd=( "$@" )
+
+  if have_cmd ionice; then
+    cmd=( ionice -c "$IONICE_CLASS" -n "$IONICE_LEVEL" "${cmd[@]}" )
+  fi
+  if have_cmd nice; then
+    cmd=( nice -n "$NICE_LEVEL" "${cmd[@]}" )
+  fi
+
+  if have_cmd cpulimit; then
+    cpulimit -l "$CPULIMIT_PCT" -- "${cmd[@]}" >"$run_log" 2>&1
+  else
+    "${cmd[@]}" >"$run_log" 2>&1
+  fi
+}
+
+wait_for_slot() {
+  while (( $(jobs -rp | wc -l) >= JOBS )); do
+    wait -n || true
+  done
+}
+
+safe_tag() {
+  local mode="$1" be="$2" run="$3"
+  echo "p8_${mode}_be${be}_s${SEED}_r${run}"
+}
+
+init_master_csv() {
+  mkdir -p "$(dirname "$CSV_OUT")"
+  echo "$CSV_HEADER" > "$CSV_OUT"
+}
+
+merge_summary_csv() {
+  init_master_csv
+  local f first
+  while IFS= read -r f; do
+    [[ -s "$f" ]] || continue
+    first="$(head -n 1 "$f" || true)"
+    if [[ "$first" == "$CSV_HEADER" ]] || [[ "$first" == mode,beRateMbps,* ]]; then
+      tail -n +2 "$f" >> "$CSV_OUT" || true
+    else
+      cat "$f" >> "$CSV_OUT" || true
+    fi
+  done < <(find "$TMP_ROOT" -type f -path "*/raw/p8_summary.csv" | sort)
+  log "[P8] Merge -> $CSV_OUT"
+}
+
+run_one() {
+  local tag="$1" args="$2" out_run="$3" seq="$4" total="$5"
+  local run_log="$LOG_DIR/${tag}.log"
 
   log "[P8] [${seq}/${total}] RUN start  ${tag}"
 
-  if [[ "$QUIET_RUN" == "true" ]]; then
-    ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" ) >"$log_path" 2>&1 || {
-      echo
-      warn "[P8] RUN FAILED: $tag"
-      warn "[P8] Log file: $log_path"
-      warn "[P8] Last ${TAIL_LINES} lines:"
-      tail -n "$TAIL_LINES" "$log_path" || true
-      return 1
-    }
+  mkdir -p "$out_run/raw" "$out_run/logs" "$out_run/plots" "$out_run/pcap"
+  echo "$CSV_HEADER" > "$out_run/raw/p8_summary.csv"
+
+  if ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" --no-build ) >/dev/null 2>&1; then
+    run_cmd_wrapped "$run_log" bash -lc "cd \"$NS3_DIR\" && ./ns3 run \"${SCENARIO} ${args}\" --no-build"
   else
-    ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" ) | tee "$log_path" || {
-      echo
-      warn "[P8] RUN FAILED: $tag"
-      warn "[P8] Log file: $log_path"
-      return 1
-    }
+    run_cmd_wrapped "$run_log" bash -lc "cd \"$NS3_DIR\" && ./ns3 run \"${SCENARIO} ${args}\""
+  fi
+
+  local rc=$?
+  if (( rc != 0 )); then
+    warn "[P8] [${seq}/${total}] RUN FAILED: $tag (rc=$rc)"
+    warn "[P8] Log file: $run_log"
+    tail -n "$TAIL_LINES" "$run_log" || true
+    return "$rc"
   fi
 
   log "[P8] [${seq}/${total}] RUN ok     ${tag}"
   return 0
 }
 
-exists_ok() {
-  local path="$1"
-  if [[ -s "$path" ]]; then
-    echo "OK   $path"
-    return 0
-  fi
-  echo "MISS $path"
-  return 1
-}
-
-usage() {
-  cat <<EOF
-Usage: ./scripts/run_p8.sh
-
-Overrides:
-  NS3_DIR=~/ns-3 OUTDIR=results/p8 ./scripts/run_p8.sh
-  SCEN_SRC=./scenarios/p8_qos_wmm.cc ./scripts/run_p8.sh
-  CLEAN=false QUIET_RUN=false ./scripts/run_p8.sh
-  STOP_ON_FIRST_FAIL=true ./scripts/run_p8.sh
-
-Sweep:
-  BE_RATES="0,10,20,40,60"
-EOF
-}
-
-report_outputs() {
-  echo
-  echo "====================== [P8] Summary ======================"
-  echo "NS3_DIR : $NS3_DIR"
-  echo "Scenario: $SCENARIO"
-  echo "OutDir  : $OUTDIR"
-  echo "Logs    : $OUTDIR/logs"
-  echo "Raw     : $OUTDIR/raw"
-  echo "Plots   : $OUTDIR/plots"
-  echo "----------------------------------------------------------"
-  echo "[P8] Required files check (best-effort):"
-
-  exists_ok "$OUTDIR/raw/p8_summary.csv" || true
-  exists_ok "$OUTDIR/raw/p8_flowmon.xml" || true
-
-  echo "=========================================================="
-}
-
-# Parse comma-separated BE_RATES into global array RATES_ARR
-parse_rates() {
-  local csv="$1"
-  IFS=',' read -r -a RATES_ARR <<< "$csv"
-}
-
-# Common args builder (must match your C++ CommandLine)
-common_args() {
-  local runnum="$1"
-  echo "\
---duration=${DURATION} --appStart=${APPSTART} \
---standard=${STANDARD} --dataMode=${DATAMODE} --ctrlMode=${CTRLMODE} \
---txPowerDbm=${TXPWR} \
---channelWidth=${CHWIDTH} --channelNumber=${CHANNELNUM} \
---outDir=${OUTDIR} --pcap=${PCAP} --flowmon=${FLOWMON} \
---seed=${SEED} --run=${runnum} \
---voPktSize=${VOIP_PKTSIZE} --voPps=${VOIP_PPS} \
---viPktSize=${VIDEO_PKTSIZE} --viRateMbps=${VIDEO_RATE_MBPS} \
---bePktSize=${BE_PKTSIZE}"
-}
-
-# ---------------------------- Main ----------------------------
+# -------------------- main --------------------
 main() {
-  need_cmd tail
-  need_cmd find
-  need_cmd sort
-
-  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    usage
-    exit 0
-  fi
+  if (( JOBS > MAX_JOBS )); then JOBS="$MAX_JOBS"; fi
+  if (( JOBS < 1 )); then JOBS=1; fi
+  if (( BUILD_JOBS < 1 )); then BUILD_JOBS=1; fi
 
   ensure_dirs
-
   if [[ "$CLEAN" == "true" ]]; then
     clean_outputs
-  else
-    log "[P8] CLEAN disabled; existing outputs may be overwritten/appended"
   fi
+  mkdir -p "$TMP_ROOT"
 
-  init_csv
   stage_scenario
-  build_ns3
+  build_ns3_low_heat
 
-  parse_rates "$BE_RATES"
-  local rates_arr=("${RATES_ARR[@]}")
+  local -a BE_RATES MODES
+  to_array "$BE_RATES_STR" BE_RATES
+  to_array "$MODES_STR" MODES
 
-  local SWEEP_RUNS=$(( ${#rates_arr[@]} * 2 ))
-  local TOTAL_RUNS=$(( 1 + 2 + SWEEP_RUNS ))  # baseline + congestion(OFF/ON) + sweep
-
-  local FAIL=0
-  local IDX=0
-
-  # ---------------- baseline (VO+VI only) ----------------
-  {
-    local runnum=$((RUN_BASE + IDX))
-    local seq=$((IDX + 1))
-    local tag="baseline_vo_vi_only_run${runnum}"
-    local args
-    args="$(common_args "$runnum") --mode=OFF --beRateMbps=0"
-    if ! run_ns3 "$tag" "$args" "$seq" "$TOTAL_RUNS"; then
-      FAIL=$((FAIL + 1))
-      [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && report_outputs && die "[P8] Aborting on first failure"
-    fi
-    IDX=$((IDX + 1))
-  }
-
-  # ---------------- congestion OFF/ON at BE_RATE_DEFAULT ----------------
-  for MODE in OFF ON; do
-    local runnum=$((RUN_BASE + IDX))
-    local seq=$((IDX + 1))
-    local tag="congestion_${MODE}_be${BE_RATE_DEFAULT}_run${runnum}"
-    local args
-    args="$(common_args "$runnum") --mode=${MODE} --beRateMbps=${BE_RATE_DEFAULT}"
-    if ! run_ns3 "$tag" "$args" "$seq" "$TOTAL_RUNS"; then
-      FAIL=$((FAIL + 1))
-      [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && report_outputs && die "[P8] Aborting on first failure"
-    fi
-    IDX=$((IDX + 1))
-  done
-
-  # ---------------- sweep BE rates (recommended) ----------------
-  for R in "${rates_arr[@]}"; do
-    for MODE in OFF ON; do
-      local runnum=$((RUN_BASE + IDX))
-      local seq=$((IDX + 1))
-      local tag="sweep_${MODE}_be${R}_run${runnum}"
-      local args
-      args="$(common_args "$runnum") --mode=${MODE} --beRateMbps=${R}"
-      if ! run_ns3 "$tag" "$args" "$seq" "$TOTAL_RUNS"; then
-        FAIL=$((FAIL + 1))
-        [[ "$STOP_ON_FIRST_FAIL" == "true" ]] && report_outputs && die "[P8] Aborting on first failure"
-      fi
-      IDX=$((IDX + 1))
+  local -a jobs_list=()
+  local be mode
+  for be in "${BE_RATES[@]}"; do
+    for mode in "${MODES[@]}"; do
+      jobs_list+=( "${mode}|${be}" )
     done
   done
 
-  report_outputs
+  local total="${#jobs_list[@]}"
+  (( total > 0 )) || die "[P8] No runs to execute."
+  log "[P8] Runs: total=${total}, max parallel JOBS=${JOBS}"
 
-  if [[ $FAIL -ne 0 ]]; then
-    die "[P8] Completed with failures: $FAIL (see $OUTDIR/logs/)"
+  local idx=0 run_num tag out_run args item
+  for item in "${jobs_list[@]}"; do
+    IFS='|' read -r mode be <<< "$item"
+    idx=$((idx + 1))
+    run_num=$((RUN_BASE + idx - 1))
+
+    tag="$(safe_tag "$mode" "$be" "$run_num")"
+    out_run="$TMP_ROOT/$tag"
+    mkdir -p "$out_run"
+
+    # IMPORTANT: outDir per run to avoid overwrite/races
+    args="--mode=${mode} --beRateMbps=${be} --duration=${DURATION} --appStart=${APP_START}"
+    args+=" --seed=${SEED} --run=${run_num} --outDir=${out_run}"
+    args+=" --flowmon=${FLOWMON} --pcap=${PCAP} --verboseApp=${VERBOSE_APP}"
+    args+=" --standard=${STANDARD} --dataMode=${DATAMODE} --ctrlMode=${CTRLMODE}"
+    args+=" --txPowerDbm=${TXPOWER_DBM} --channelWidth=${CHANNEL_WIDTH} --channelNumber=${CHANNEL_NUMBER}"
+    args+=" --voPktSize=${VO_PKT} --voPps=${VO_PPS}"
+    args+=" --viPktSize=${VI_PKT} --viRateMbps=${VI_RATE}"
+    args+=" --bePktSize=${BE_PKT}"
+
+    if [[ -n "$EXTRA_ARGS" ]]; then
+      args+=" ${EXTRA_ARGS}"
+    fi
+
+    wait_for_slot
+    ( run_one "$tag" "$args" "$out_run" "$idx" "$total" ) &
+
+    if (( LAUNCH_STAGGER_MS > 0 )); then
+      python3 - <<PY >/dev/null 2>&1 || true
+import time
+time.sleep(${LAUNCH_STAGGER_MS}/1000.0)
+PY
+    fi
+  done
+
+  wait || true
+
+  merge_summary_csv
+
+  # Copy per-run artifacts for inspection
+  mkdir -p "$RAW_DIR/per_run_raw"
+  if have_cmd rsync; then
+    rsync -a --delete "$TMP_ROOT/" "$RAW_DIR/per_run_raw/" >/dev/null 2>&1 || true
+  else
+    rm -rf "$RAW_DIR/per_run_raw" || true
+    mkdir -p "$RAW_DIR/per_run_raw"
+    cp -a "$TMP_ROOT/." "$RAW_DIR/per_run_raw/" 2>/dev/null || true
   fi
 
-  log "[P8] All runs completed successfully."
+  if [[ "$KEEP_TMP" != "true" ]]; then
+    rm -rf "$TMP_ROOT" || true
+  else
+    log "[P8] KEEP_TMP=true (tmp runs kept at: $TMP_ROOT)"
+  fi
+
+  cat <<EOF
+
+====================== [P8] Summary ======================
+NS3_DIR : $NS3_DIR
+Scenario: $SCENARIO
+Source  : $SCEN_SRC
+OutDir  : $OUTDIR
+Raw     : $RAW_DIR
+Logs    : $LOG_DIR
+Plots   : $PLOT_DIR
+----------------------------------------------------------
+Key outputs:
+  - $CSV_OUT
+  - per-run artifacts under $RAW_DIR/per_run_raw/
+==========================================================
+
+EOF
+
+  log "[P8] Done."
 }
 
 main "$@"

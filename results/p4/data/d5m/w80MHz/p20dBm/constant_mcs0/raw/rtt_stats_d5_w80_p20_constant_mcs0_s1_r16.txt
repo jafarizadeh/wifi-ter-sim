@@ -1,3 +1,0 @@
-samples=36
-mean_ms=177.139
-p95_ms=190

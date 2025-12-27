@@ -1,215 +1,320 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WIFI-TER-SIM — Project 9 plotting (no-args default runner)
+Project 9 (ns-3) - Plotting script (NO statsmodels / NO plotly required)
 
-Run:
-  python scripts/plot_p9.py
-(or)
-  python3 scripts/plot_p9.py
+Reads:
+  results/p9/heatmaps/heatmap.csv
+  results/p9/raw/grid.csv
 
-Defaults:
-  grid   = results/p9/raw/grid.csv
-  heat   = results/p9/heatmaps/heatmap.csv
-  outdir = results/p9/plots
+Writes PNGs into:
+  results/p9/plots/
 
-Also supports overriding with optional args:
-  --grid PATH --heatmap PATH --out PATH
+Usage (from WIFI-TER-SIM/scripts):
+  python3 plot_p9.py
+
+Optional:
+  python3 plot_p9.py --results ../results/p9 --apX 0 --apY 0
+  python3 plot_p9.py --standard ax --transport udp
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
+import math
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-import matplotlib
-matplotlib.use("Agg")  # headless-safe
 import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
+import matplotlib.tri as mtri
 
+# --------------------------- helpers ---------------------------
 
-# ------------------------ helpers ------------------------
-
-def repo_root_from_this_file() -> Path:
-    # scripts/plot_p9.py -> repo root = parent of "scripts"
+def repo_root_from_here() -> Path:
+    # .../WIFI-TER-SIM/scripts/plot_p9.py -> repo root is parent of scripts
     return Path(__file__).resolve().parents[1]
 
-def ensure_out(dirpath: Path) -> None:
-    dirpath.mkdir(parents=True, exist_ok=True)
+def safe_mkdir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
-def load_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path)
+def read_csv_if_exists(p: Path) -> pd.DataFrame | None:
+    if not p.exists():
+        return None
+    try:
+        df = pd.read_csv(p)
+        return df
+    except Exception as e:
+        print(f"[ERROR] Cannot read {p}: {e}", file=sys.stderr)
+        return None
 
-def pivot_metric(df: pd.DataFrame, metric: str):
-    # pivot to 2D array Z with shape (len(ys), len(xs))
-    piv = df.pivot_table(index="y", columns="x", values=metric, aggfunc="mean")
-    ys = np.array(sorted(df["y"].unique()))
-    xs = np.array(sorted(df["x"].unique()))
-    Z = piv.reindex(index=ys, columns=xs).to_numpy()
-    return xs, ys, Z
+def to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
-def savefig(path: Path, title: str | None = None):
-    if title:
-        plt.title(title)
-    plt.tight_layout()
-    plt.savefig(path, dpi=220, bbox_inches="tight")
-    plt.close()
+def filter_df(df: pd.DataFrame, standard: str | None, transport: str | None, rate_control: str | None) -> pd.DataFrame:
+    out = df.copy()
+    for col, val in [("standard", standard), ("transport", transport), ("rateControl", rate_control)]:
+        if val is None:
+            continue
+        if col in out.columns:
+            out = out[out[col].astype(str).str.lower() == val.lower()]
+    return out
 
-def plot_heatmap(df: pd.DataFrame, metric: str, out_dir: Path, title: str | None = None):
-    xs, ys, Z = pivot_metric(df, metric)
-    plt.figure(figsize=(7.2, 5.8))
-    extent = (xs.min(), xs.max(), ys.min(), ys.max())
-    plt.imshow(Z, origin="lower", aspect="auto", extent=extent)
-    plt.xlabel("x (m)")
-    plt.ylabel("y (m)")
-    cb = plt.colorbar()
-    cb.set_label(metric)
-    savefig(out_dir / f"heatmap_{metric}.png", title or f"Heatmap — {metric}")
+def distance_xy(df: pd.DataFrame, apx: float, apy: float) -> np.ndarray:
+    return np.sqrt((df["x"].to_numpy() - apx) ** 2 + (df["y"].to_numpy() - apy) ** 2)
 
-def plot_surface(df: pd.DataFrame, metric: str, out_dir: Path, title: str | None = None):
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-    xs, ys, Z = pivot_metric(df, metric)
-    X, Y = np.meshgrid(xs, ys)
-    fig = plt.figure(figsize=(7.2, 5.8))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.plot_surface(X, Y, Z)
+def binned_stat(x: np.ndarray, y: np.ndarray, bins: int = 20, stat: str = "median"):
+    """Return bin centers and binned statistic (median/mean) with robust NaN handling."""
+    m = np.isfinite(x) & np.isfinite(y)
+    x = x[m]
+    y = y[m]
+    if x.size == 0:
+        return np.array([]), np.array([])
+
+    edges = np.linspace(x.min(), x.max(), bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    out = np.full(bins, np.nan)
+
+    for i in range(bins):
+        sel = (x >= edges[i]) & (x < edges[i + 1]) if i < bins - 1 else (x >= edges[i]) & (x <= edges[i + 1])
+        if np.any(sel):
+            if stat == "mean":
+                out[i] = np.nanmean(y[sel])
+            else:
+                out[i] = np.nanmedian(y[sel])
+    return centers, out
+
+def savefig(fig, path: Path, dpi: int = 200):
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+
+def tri_heatmap(x, y, z, title: str, outpath: Path, apx: float, apy: float, cmap: str = "turbo", vmin=None, vmax=None):
+    """Scattered 2D heatmap using triangulation (works for irregular grids)."""
+    m = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+    x = x[m]; y = y[m]; z = z[m]
+    if x.size < 3:
+        return
+    tri = mtri.Triangulation(x, y)
+    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+    tpc = ax.tricontourf(tri, z, levels=30, cmap=cmap, vmin=vmin, vmax=vmax)
+    cb = fig.colorbar(tpc, ax=ax)
+    cb.ax.set_ylabel(title)
+    ax.scatter([apx], [apy], marker="*", s=160, edgecolor="k")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
-    ax.set_zlabel(metric)
-    savefig(out_dir / f"surface_{metric}.png", title or f"Surface — {metric}")
+    ax.set_title(title)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25)
+    savefig(fig, outpath)
 
-def plot_scatter_xy(df: pd.DataFrame, metric: str, out_dir: Path, title: str | None = None):
-    plt.figure(figsize=(7.2, 5.8))
-    plt.scatter(df["x"], df["y"], s=22, c=df[metric])
-    plt.xlabel("x (m)")
-    plt.ylabel("y (m)")
-    cb = plt.colorbar()
-    cb.set_label(metric)
-    savefig(out_dir / f"scatter_xy_{metric}.png", title or f"Scatter XY — {metric}")
+def scatter_vs_distance(d, y, ylabel: str, title: str, outpath: Path, bins: int = 25):
+    m = np.isfinite(d) & np.isfinite(y)
+    d = d[m]; y = y[m]
+    if d.size == 0:
+        return
+    fig, ax = plt.subplots(figsize=(7.6, 4.6))
+    ax.scatter(d, y, s=18, alpha=0.5)
+    # binned median trend
+    xc, ym = binned_stat(d, y, bins=bins, stat="median")
+    ax.plot(xc, ym, linewidth=2)
+    ax.set_xlabel("Distance to AP (m)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    savefig(fig, outpath)
 
-def plot_relation(df: pd.DataFrame, xcol: str, ycol: str, out_dir: Path, title: str | None = None):
-    plt.figure(figsize=(6.6, 5.2))
-    plt.scatter(df[xcol], df[ycol], s=12, alpha=0.85)
-    plt.xlabel(xcol)
-    plt.ylabel(ycol)
-    ax = plt.gca()
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=8))
-    ax.yaxis.set_major_locator(MaxNLocator(nbins=8))
-    savefig(out_dir / f"scatter_{xcol}_vs_{ycol}.png", title or f"{ycol} vs {xcol}")
+def cdf_plot(values: np.ndarray, xlabel: str, title: str, outpath: Path):
+    v = values[np.isfinite(values)]
+    if v.size == 0:
+        return
+    v = np.sort(v)
+    p = np.linspace(0, 1, v.size, endpoint=True)
+    fig, ax = plt.subplots(figsize=(7.0, 4.6))
+    ax.plot(v, p, linewidth=2)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("CDF")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    savefig(fig, outpath)
 
-def plot_hist(df: pd.DataFrame, col: str, out_dir: Path, bins: int = 24, title: str | None = None):
-    plt.figure(figsize=(6.6, 5.2))
-    plt.hist(df[col].dropna(), bins=bins)
-    plt.xlabel(col)
-    plt.ylabel("count")
-    savefig(out_dir / f"hist_{col}.png", title or f"Histogram — {col}")
-
-def plot_performance_vs_distance(df: pd.DataFrame, out_dir: Path):
-    # If AP coords not present, assume (0,0)
-    apx = float(df["ap_x"].iloc[0]) if "ap_x" in df.columns else 0.0
-    apy = float(df["ap_y"].iloc[0]) if "ap_y" in df.columns else 0.0
-
-    tmp = df.copy()
-    tmp["distance_m"] = np.sqrt((tmp["x"] - apx) ** 2 + (tmp["y"] - apy) ** 2)
-
-    if "goodput_mbps" in tmp.columns:
-        plot_relation(tmp, "distance_m", "goodput_mbps", out_dir, "Goodput vs Distance")
-    if "rtt_ms" in tmp.columns:
-        plot_relation(tmp, "distance_m", "rtt_ms", out_dir, "RTT vs Distance")
-    if "loss" in tmp.columns:
-        plot_relation(tmp, "distance_m", "loss", out_dir, "Loss vs Distance")
-
-
-# ------------------------ main ------------------------
-
-def parse_args(default_grid: Path, default_heat: Path, default_out: Path):
-    p = argparse.ArgumentParser(add_help=True)
-    p.add_argument("--grid", default=str(default_grid), help="Path to results/p9/raw/grid.csv")
-    p.add_argument("--heatmap", default=str(default_heat), help="Path to results/p9/heatmaps/heatmap.csv")
-    p.add_argument("--out", default=str(default_out), help="Output directory (default: results/p9/plots)")
-    return p.parse_args()
+# --------------------------- main ---------------------------
 
 def main():
-    root = repo_root_from_this_file()
-    default_grid = root / "results" / "p9" / "raw" / "grid.csv"
-    default_heat = root / "results" / "p9" / "heatmaps" / "heatmap.csv"
-    default_out  = root / "results" / "p9" / "plots"
+    parser = argparse.ArgumentParser(description="Plot Project 9 results (no plotly/statsmodels).")
+    parser.add_argument("--results", type=str, default=None, help="Path to results/p9 (default auto-detect).")
+    parser.add_argument("--apX", type=float, default=0.0, help="AP X coordinate (default 0.0)")
+    parser.add_argument("--apY", type=float, default=0.0, help="AP Y coordinate (default 0.0)")
+    parser.add_argument("--standard", type=str, default=None, help="Filter: ax/ac/n (optional)")
+    parser.add_argument("--transport", type=str, default=None, help="Filter: udp/tcp (optional)")
+    parser.add_argument("--rateControl", type=str, default=None, help="Filter: adaptive/constant (optional)")
+    parser.add_argument("--bins", type=int, default=25, help="Bins for distance trend (default 25)")
+    args = parser.parse_args()
 
-    args = parse_args(default_grid, default_heat, default_out)
+    root = repo_root_from_here()
+    p9 = Path(args.results).expanduser().resolve() if args.results else (root / "results" / "p9")
+    heat_csv = p9 / "heatmaps" / "heatmap.csv"
+    grid_csv = p9 / "raw" / "grid.csv"
+    out_dir = p9 / "plots"
+    safe_mkdir(out_dir)
 
-    grid_path = Path(args.grid).expanduser().resolve()
-    heat_path = Path(args.heatmap).expanduser().resolve()
-    out_dir   = Path(args.out).expanduser().resolve()
+    heat = read_csv_if_exists(heat_csv)
+    grid = read_csv_if_exists(grid_csv)
 
-    if not grid_path.exists():
-        raise SystemExit(f"[plot_p9] grid.csv not found: {grid_path}")
-    if not heat_path.exists():
-        raise SystemExit(f"[plot_p9] heatmap.csv not found: {heat_path}")
+    if heat is None and grid is None:
+        print(f"[ERROR] Cannot find CSVs in: {p9}", file=sys.stderr)
+        print(f"  expected: {heat_csv}", file=sys.stderr)
+        print(f"  expected: {grid_csv}", file=sys.stderr)
+        return 2
 
-    ensure_out(out_dir)
+    # Normalize numeric types
+    if heat is not None:
+        heat = to_numeric(heat, ["x","y","associated","offered_mbps","goodput_mbps","avg_rtt_ms","rtt_replies",
+                                 "tx_bytes","rx_bytes","loss_ratio","rssi_est_dbm","snr_est_db","seed","run","channelWidth"])
+        heat = filter_df(heat, args.standard, args.transport, args.rateControl)
 
-    grid = load_csv(grid_path)
-    heat = load_csv(heat_path)
+    if grid is not None:
+        grid = to_numeric(grid, ["x","y","seed","run","rssi_dbm","snr_db","goodput_mbps","rtt_ms","delay_ms","loss"])
+        # grid doesn't include standard/transport columns, so no filtering beyond possible merge
+        # if heat is available, we'll plot mainly from heat; otherwise from grid.
 
-    # --- Required heatmaps from grid.csv ---
-    for m in ["rssi_dbm", "goodput_mbps", "rtt_ms"]:
-        if m in grid.columns:
-            plot_heatmap(grid, m, out_dir)
+    # Pick a "base" dataframe for most plots
+    if heat is not None and len(heat) > 0:
+        df = heat.copy()
+        # ensure column names consistent with grid.csv
+        df["rssi_dbm"] = df.get("rssi_est_dbm", np.nan)
+        df["snr_db"] = df.get("snr_est_db", np.nan)
+        df["rtt_ms"] = df.get("avg_rtt_ms", np.nan)
+        df["loss"] = df.get("loss_ratio", np.nan)
+        df["delay_ms"] = np.nan  # may be filled via merge below
+        # attach delay from grid if possible (match x,y,seed,run)
+        if grid is not None and len(grid) > 0:
+            mg = grid[["x","y","seed","run","delay_ms"]].copy()
+            df = df.merge(mg, on=["x","y","seed","run"], how="left", suffixes=("","_g"))
+            if "delay_ms_g" in df.columns:
+                df["delay_ms"] = df["delay_ms_g"]
+                df.drop(columns=["delay_ms_g"], inplace=True)
+    else:
+        df = grid.copy()
 
-    # --- Extra useful heatmaps ---
-    for m in ["snr_db", "loss"]:
-        if m in grid.columns:
-            plot_heatmap(grid, m, out_dir)
+    # Add distance
+    if "x" in df.columns and "y" in df.columns:
+        df["distance_m"] = distance_xy(df, args.apX, args.apY)
+    else:
+        print("[ERROR] CSV missing x/y columns.", file=sys.stderr)
+        return 2
 
-    # --- Surface (nice for report/appendix) ---
-    for m in ["goodput_mbps", "rssi_dbm"]:
-        if m in grid.columns:
-            plot_surface(grid, m, out_dir)
+    # --------------------------- summary ---------------------------
+    summary_path = out_dir / "summary_p9.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(f"Results folder: {p9}\n")
+        f.write(f"Rows used: {len(df)}\n")
+        f.write(f"AP: ({args.apX}, {args.apY})\n")
+        if heat is not None:
+            f.write(f"heatmap.csv rows after filters: {len(heat)}\n")
+            for k in ["standard","transport","rateControl","channelWidth"]:
+                if k in heat.columns:
+                    f.write(f"{k} unique: {sorted(set(map(str, heat[k].dropna().unique().tolist())))}\n")
+        for col in ["goodput_mbps","offered_mbps","rtt_ms","delay_ms","loss","rssi_dbm","snr_db","associated"]:
+            if col in df.columns:
+                s = pd.to_numeric(df[col], errors="coerce")
+                f.write(f"\n[{col}]\n")
+                f.write(s.describe(percentiles=[0.05,0.25,0.5,0.75,0.95]).to_string() + "\n")
 
-    # --- XY scatter (colored) ---
-    for m in ["rssi_dbm", "snr_db", "goodput_mbps", "rtt_ms", "loss"]:
-        if m in grid.columns:
-            plot_scatter_xy(grid, m, out_dir)
+    # --------------------------- 2D heatmaps ---------------------------
+    x = df["x"].to_numpy()
+    y = df["y"].to_numpy()
 
-    # --- Relationships ---
-    if {"rssi_dbm", "goodput_mbps"}.issubset(grid.columns):
-        plot_relation(grid, "rssi_dbm", "goodput_mbps", out_dir, "Goodput vs RSSI")
-    if {"snr_db", "loss"}.issubset(grid.columns):
-        plot_relation(grid, "snr_db", "loss", out_dir, "Loss vs SNR")
-    if {"goodput_mbps", "rtt_ms"}.issubset(grid.columns):
-        plot_relation(grid, "goodput_mbps", "rtt_ms", out_dir, "RTT vs Goodput")
+    # Goodput
+    if "goodput_mbps" in df.columns:
+        tri_heatmap(x, y, df["goodput_mbps"].to_numpy(),
+                    "Goodput (Mbps)", out_dir / "heatmap_goodput_mbps.png", args.apX, args.apY)
 
-    # --- Histograms ---
-    for m in ["rssi_dbm", "snr_db", "goodput_mbps", "rtt_ms", "loss"]:
-        if m in grid.columns:
-            plot_hist(grid, m, out_dir)
+    # RTT
+    if "rtt_ms" in df.columns:
+        tri_heatmap(x, y, df["rtt_ms"].to_numpy(),
+                    "RTT (ms)", out_dir / "heatmap_rtt_ms.png", args.apX, args.apY, cmap="viridis")
 
-    # --- Distance-based diagnostics ---
-    plot_performance_vs_distance(grid, out_dir)
+    # Delay (FlowMonitor)
+    if "delay_ms" in df.columns and np.isfinite(df["delay_ms"]).any():
+        tri_heatmap(x, y, df["delay_ms"].to_numpy(),
+                    "Mean delay (ms)", out_dir / "heatmap_delay_ms.png", args.apX, args.apY, cmap="viridis")
 
-    # --- Optional: also plot from heatmap.csv fields (if you want them too) ---
-    # these are "extra" fields your simulator writes
-    if "loss_ratio" in heat.columns:
-        tmp = heat.rename(columns={"loss_ratio": "loss"})
-        plot_heatmap(tmp, "loss", out_dir, "Heatmap — loss_ratio")
-    if "avg_rtt_ms" in heat.columns:
-        tmp = heat.rename(columns={"avg_rtt_ms": "rtt_ms"})
-        plot_heatmap(tmp, "rtt_ms", out_dir, "Heatmap — avg_rtt_ms")
-    if "rssi_est_dbm" in heat.columns:
-        tmp = heat.rename(columns={"rssi_est_dbm": "rssi_dbm"})
-        plot_heatmap(tmp, "rssi_dbm", out_dir, "Heatmap — rssi_est_dbm")
-    if "snr_est_db" in heat.columns:
-        tmp = heat.rename(columns={"snr_est_db": "snr_db"})
-        plot_heatmap(tmp, "snr_db", out_dir, "Heatmap — snr_est_db")
+    # Loss
+    if "loss" in df.columns:
+        tri_heatmap(x, y, df["loss"].to_numpy(),
+                    "Loss ratio", out_dir / "heatmap_loss.png", args.apX, args.apY, cmap="magma", vmin=0.0, vmax=1.0)
 
-    generated = sorted([p.name for p in out_dir.iterdir() if p.suffix.lower() == ".png"])
-    print(json.dumps({"out_dir": str(out_dir), "generated": generated}, indent=2))
+    # RSSI/SNR
+    if "rssi_dbm" in df.columns:
+        tri_heatmap(x, y, df["rssi_dbm"].to_numpy(),
+                    "Estimated RSSI (dBm)", out_dir / "heatmap_rssi_dbm.png", args.apX, args.apY, cmap="plasma")
+    if "snr_db" in df.columns:
+        tri_heatmap(x, y, df["snr_db"].to_numpy(),
+                    "Estimated SNR (dB)", out_dir / "heatmap_snr_db.png", args.apX, args.apY, cmap="plasma")
+
+    # Association (binary)
+    if "associated" in df.columns:
+        tri_heatmap(x, y, df["associated"].to_numpy(),
+                    "Associated (1=yes)", out_dir / "heatmap_associated.png", args.apX, args.apY, cmap="cividis", vmin=0, vmax=1)
+
+    # --------------------------- distance trends ---------------------------
+    d = df["distance_m"].to_numpy()
+
+    if "goodput_mbps" in df.columns:
+        scatter_vs_distance(d, df["goodput_mbps"].to_numpy(),
+                            "Goodput (Mbps)", "Goodput vs Distance", out_dir / "goodput_vs_distance.png", bins=args.bins)
+        cdf_plot(df["goodput_mbps"].to_numpy(), "Goodput (Mbps)", "CDF of Goodput", out_dir / "cdf_goodput.png")
+
+    if "rtt_ms" in df.columns:
+        scatter_vs_distance(d, df["rtt_ms"].to_numpy(),
+                            "RTT (ms)", "RTT vs Distance", out_dir / "rtt_vs_distance.png", bins=args.bins)
+        cdf_plot(df["rtt_ms"].to_numpy(), "RTT (ms)", "CDF of RTT", out_dir / "cdf_rtt.png")
+
+    if "delay_ms" in df.columns and np.isfinite(df["delay_ms"]).any():
+        scatter_vs_distance(d, df["delay_ms"].to_numpy(),
+                            "Mean delay (ms)", "Mean delay vs Distance", out_dir / "delay_vs_distance.png", bins=args.bins)
+        cdf_plot(df["delay_ms"].to_numpy(), "Mean delay (ms)", "CDF of Mean delay", out_dir / "cdf_delay.png")
+
+    if "loss" in df.columns:
+        scatter_vs_distance(d, df["loss"].to_numpy(),
+                            "Loss ratio", "Loss vs Distance", out_dir / "loss_vs_distance.png", bins=args.bins)
+        cdf_plot(df["loss"].to_numpy(), "Loss ratio", "CDF of Loss", out_dir / "cdf_loss.png")
+
+    if "rssi_dbm" in df.columns:
+        scatter_vs_distance(d, df["rssi_dbm"].to_numpy(),
+                            "RSSI (dBm)", "RSSI estimate vs Distance", out_dir / "rssi_vs_distance.png", bins=args.bins)
+        cdf_plot(df["rssi_dbm"].to_numpy(), "RSSI (dBm)", "CDF of RSSI estimate", out_dir / "cdf_rssi.png")
+
+    if "snr_db" in df.columns:
+        scatter_vs_distance(d, df["snr_db"].to_numpy(),
+                            "SNR (dB)", "SNR estimate vs Distance", out_dir / "snr_vs_distance.png", bins=args.bins)
+        cdf_plot(df["snr_db"].to_numpy(), "SNR (dB)", "CDF of SNR estimate", out_dir / "cdf_snr.png")
+
+    # --------------------------- correlation matrix (numeric) ---------------------------
+    num_cols = [c for c in ["goodput_mbps","offered_mbps","rtt_ms","delay_ms","loss","rssi_dbm","snr_db","distance_m"] if c in df.columns]
+    if len(num_cols) >= 2:
+        corr = df[num_cols].corr(numeric_only=True)
+        fig, ax = plt.subplots(figsize=(7.5, 6.5))
+        im = ax.imshow(corr.to_numpy(), aspect="auto")
+        fig.colorbar(im, ax=ax)
+        ax.set_xticks(range(len(num_cols)), labels=num_cols, rotation=45, ha="right")
+        ax.set_yticks(range(len(num_cols)), labels=num_cols)
+        ax.set_title("Correlation matrix")
+        # annotate
+        for i in range(len(num_cols)):
+            for j in range(len(num_cols)):
+                ax.text(j, i, f"{corr.iloc[i,j]:.2f}", ha="center", va="center", fontsize=8)
+        savefig(fig, out_dir / "corr_matrix.png")
+
+    print(f"[OK] Plots saved to: {out_dir}")
+    print(f"[OK] Summary saved to: {summary_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

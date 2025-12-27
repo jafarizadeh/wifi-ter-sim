@@ -1,781 +1,821 @@
-/*
- * Projet 9 (ns-3.41) - Heatmap generator (single point per run)
- *
- * Topology: 1 STA (probe) <Wi-Fi> 1 AP <CSMA> 1 Server
- * One run per (x,y) -> append one CSV line: <outDir>/heatmaps/heatmap.csv
- *
- * Metrics in window [appStart, appStart+measureTime]:
- *  - offered_mbps (app Tx bytes in window)
- *  - goodput_mbps (sink Rx bytes in window)
- *  - RTT (custom UDP timestamp echo)
- *  - loss_ratio (1 - rxBytes/txBytes in the window)
- *  - estimated RSSI/SNR (simple model)
- *
- * NOTE (your ns-3.41 build):
- *  - Do NOT set WifiPhy ChannelWidth via attributes (it triggers NS_FATAL).
- *  - channelWidth is used only for the SNR estimate + CSV column.
- */
-
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
 #include "ns3/internet-module.h"
-#include "ns3/mobility-module.h"
 #include "ns3/wifi-module.h"
-#include "ns3/wifi-net-device.h"
 #include "ns3/yans-wifi-helper.h"
+#include "ns3/mobility-module.h"
 #include "ns3/csma-module.h"
 #include "ns3/applications-module.h"
-#include "ns3/flow-monitor-module.h"
 
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <string>
 #include <algorithm>
-#include <cmath>
+#include <cstdint>
 
 using namespace ns3;
 
 // -------------------- utilities --------------------
-static std::string
-ToLower(std::string s)
+static void EnsureDir(const std::string &dir)
 {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c)
-                   { return std::tolower(c); });
-    return s;
+  SystemPath::MakeDirectories(dir);
 }
 
-static void
-EnsureDir(const std::string &dir)
+static bool IsFileEmptyOrMissing(const std::string &path)
 {
-    SystemPath::MakeDirectories(dir);
+  std::ifstream f(path.c_str(), std::ios::in | std::ios::binary);
+  if (!f.good())
+    return true;
+  f.seekg(0, std::ios::end);
+  return (f.tellg() <= 0);
 }
 
-static bool
-IsFileEmptyOrMissing(const std::string &path)
+static void EnsureCsvHeader(const std::string &path, const std::string &headerLine)
 {
-    std::ifstream f(path.c_str(), std::ios::in | std::ios::binary);
-    if (!f.good())
-    {
-        return true;
-    }
-    f.seekg(0, std::ios::end);
-    return (f.tellg() <= 0);
+  if (IsFileEmptyOrMissing(path))
+  {
+    std::ofstream out(path.c_str(), std::ios::out);
+    out << headerLine << "\n";
+  }
 }
 
-static void
-EnsureCsvHeader(const std::string &path, const std::string &headerLine)
+static std::string ToLower(std::string s)
 {
-    if (IsFileEmptyOrMissing(path))
-    {
-        std::ofstream out(path.c_str(), std::ios::out);
-        out << headerLine << "\n";
-    }
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return s;
 }
 
-static WifiStandard
-ParseStandard(const std::string &sIn)
+// -------------------- Wi-Fi standard parser --------------------
+static WifiStandard ParseStandard(const std::string &s0)
 {
-    const std::string s = ToLower(sIn);
-    if (s == "ax")
-    {
-        return WIFI_STANDARD_80211ax;
-    }
-    if (s == "ac")
-    {
-        return WIFI_STANDARD_80211ac;
-    }
-    if (s == "n")
-    {
-        return WIFI_STANDARD_80211n;
-    }
+  std::string s = ToLower(s0);
+  if (s == "ax")
     return WIFI_STANDARD_80211ax;
+  if (s == "ac")
+    return WIFI_STANDARD_80211ac;
+  if (s == "n")
+    return WIFI_STANDARD_80211n;
+  return WIFI_STANDARD_80211ax;
 }
 
-static double
-Distance2d(double x1, double y1, double x2, double y2)
+// -------------------- PHY RSSI/SNR accumulation --------------------
+static double g_measureStartS = 0.0;
+static double g_rssiSumDbm = 0.0;
+static double g_snrSumDb = 0.0;
+static uint64_t g_rssiCount = 0;
+
+static void MonitorSnifferRxTrace(Ptr<const Packet> /*packet*/,
+                                  uint16_t /*channelFreqMhz*/,
+                                  WifiTxVector /*txVector*/,
+                                  MpduInfo /*aMpdu*/,
+                                  SignalNoiseDbm signalNoise,
+                                  uint16_t /*staId*/)
 {
-    const double dx = x1 - x2;
-    const double dy = y1 - y2;
-    return std::sqrt(dx * dx + dy * dy);
+  if (Simulator::Now().GetSeconds() < g_measureStartS)
+    return;
+
+  g_rssiSumDbm += signalNoise.signal;
+  g_snrSumDb += (signalNoise.signal - signalNoise.noise);
+  g_rssiCount++;
 }
 
-static double
-EstimateRxPowerDbm(const std::string &propModel,
-                   double txPowerDbm,
-                   double dMeters,
-                   double refDistance,
-                   double refLossDb,
-                   double exponent,
-                   double freqMHz)
-{
-    const double d = std::max(dMeters, 0.001);
-    const std::string pm = ToLower(propModel);
-
-    if (pm == "friis" || pm == "freespace")
-    {
-        const double c = 299792458.0;
-        const double freqHz = freqMHz * 1e6;
-        const double lambda = c / freqHz;
-        const double gain = 20.0 * std::log10(lambda / (4.0 * M_PI * d));
-        return txPowerDbm + gain;
-    }
-
-    const double ratio = d / std::max(refDistance, 0.001);
-    const double loss = refLossDb + 10.0 * exponent * std::log10(ratio);
-    return txPowerDbm - loss;
-}
-
-static double
-ThermalNoiseDbm(double bwHz, double noiseFigureDb)
-{
-    return -174.0 + 10.0 * std::log10(std::max(bwHz, 1.0)) + noiseFigureDb;
-}
-
-// -------------------- measurement state --------------------
-struct MeasureState
-{
-    Time tStart;
-    Time tEnd;
-
-    uint64_t sinkRxStart{0};
-    uint64_t sinkRxEnd{0};
-
-    uint64_t txBytesWindow{0};
-
-    uint32_t rttReplies{0};
-    double rttSumMs{0.0};
-
-    void Reset()
-    {
-        sinkRxStart = sinkRxEnd = 0;
-        txBytesWindow = 0;
-        rttReplies = 0;
-        rttSumMs = 0.0;
-    }
-};
-
-static MeasureState gMs;
-
-static void
-OnAppTx(Ptr<const Packet> p)
-{
-    const Time now = Simulator::Now();
-    if (now >= gMs.tStart && now <= gMs.tEnd)
-    {
-        gMs.txBytesWindow += p->GetSize();
-    }
-}
-
-static void
-MarkSinkRxStart(Ptr<PacketSink> sink)
-{
-    gMs.sinkRxStart = sink->GetTotalRx();
-}
-
-static void
-MarkSinkRxEnd(Ptr<PacketSink> sink)
-{
-    gMs.sinkRxEnd = sink->GetTotalRx();
-}
-
-// -------------------- RTT via custom UDP timestamp echo --------------------
-class TxTimeHeader : public Header
+// -------------------- custom header: seq + tx timestamp --------------------
+class RttHeader : public Header
 {
 public:
-    TxTimeHeader() : m_txTimeNs(0) {}
-    explicit TxTimeHeader(uint64_t ns) : m_txTimeNs(ns) {}
+  RttHeader() = default;
 
-    static TypeId GetTypeId()
-    {
-        static TypeId tid = TypeId("ns3::TxTimeHeaderP9")
-                                .SetParent<Header>()
-                                .AddConstructor<TxTimeHeader>();
-        return tid;
-    }
+  static TypeId GetTypeId()
+  {
+    static TypeId tid = TypeId("RttHeader")
+                            .SetParent<Header>()
+                            .AddConstructor<RttHeader>();
+    return tid;
+  }
 
-    TypeId GetInstanceTypeId() const override { return GetTypeId(); }
+  TypeId GetInstanceTypeId() const override { return GetTypeId(); }
 
-    uint32_t GetSerializedSize() const override { return 8; }
+  void SetSeq(uint32_t s) { m_seq = s; }
+  void SetTsNs(uint64_t t) { m_tsNs = t; }
 
-    void Serialize(Buffer::Iterator start) const override
-    {
-        start.WriteHtonU64(m_txTimeNs);
-    }
+  uint32_t GetSeq() const { return m_seq; }
+  uint64_t GetTsNs() const { return m_tsNs; }
 
-    uint32_t Deserialize(Buffer::Iterator start) override
-    {
-        m_txTimeNs = start.ReadNtohU64();
-        return 8;
-    }
+  uint32_t GetSerializedSize() const override { return 12; }
 
-    void Print(std::ostream &os) const override
-    {
-        os << "txTimeNs=" << m_txTimeNs;
-    }
+  void Serialize(Buffer::Iterator start) const override
+  {
+    start.WriteHtonU32(m_seq);
+    start.WriteHtonU64(m_tsNs);
+  }
 
-    uint64_t GetTxTimeNs() const { return m_txTimeNs; }
+  uint32_t Deserialize(Buffer::Iterator start) override
+  {
+    m_seq = start.ReadNtohU32();
+    m_tsNs = start.ReadNtohU64();
+    return 12;
+  }
+
+  void Print(std::ostream &os) const override
+  {
+    os << "seq=" << m_seq << " tsNs=" << m_tsNs;
+  }
 
 private:
-    uint64_t m_txTimeNs;
+  uint32_t m_seq{0};
+  uint64_t m_tsNs{0};
 };
 
-class UdpEchoRttServer : public Application
+// -------------------- UDP RTT server/client (echo-based) --------------------
+static double g_rttSumMs = 0.0;
+static uint64_t g_rttCount = 0;
+
+class UdpRttServerApp : public Application
 {
 public:
-    void Setup(uint16_t port) { m_port = port; }
+  void Setup(uint16_t port) { m_port = port; }
 
 private:
-    void StartApplication() override
-    {
-        m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-        InetSocketAddress local(Ipv4Address::GetAny(), m_port);
-        m_socket->Bind(local);
-        m_socket->SetRecvCallback(MakeCallback(&UdpEchoRttServer::HandleRead, this));
-    }
+  void StartApplication() override
+  {
+    m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_port));
+    m_socket->SetRecvCallback(MakeCallback(&UdpRttServerApp::HandleRead, this));
+  }
 
-    void StopApplication() override
+  void StopApplication() override
+  {
+    if (m_socket)
     {
-        if (m_socket)
-        {
-            m_socket->Close();
-            m_socket = nullptr;
-        }
+      m_socket->Close();
+      m_socket = nullptr;
     }
+  }
 
-    void HandleRead(Ptr<Socket> socket)
+  void HandleRead(Ptr<Socket> socket)
+  {
+    Address from;
+    while (Ptr<Packet> packet = socket->RecvFrom(from))
     {
-        Address from;
-        Ptr<Packet> packet = socket->RecvFrom(from);
-        while (packet && packet->GetSize() > 0)
-        {
-            socket->SendTo(packet, 0, from);
-            if (socket->GetRxAvailable() <= 0)
-            {
-                break;
-            }
-            packet = socket->RecvFrom(from);
-        }
+      if (packet->GetSize() == 0)
+        continue;
+      socket->SendTo(packet, 0, from);
     }
+  }
 
-    Ptr<Socket> m_socket;
-    uint16_t m_port{6000};
+  Ptr<Socket> m_socket;
+  uint16_t m_port{0};
 };
 
-class UdpEchoRttClient : public Application
+class UdpRttClientApp : public Application
 {
 public:
-    void Setup(Ipv4Address remote, uint16_t port, Time interval, uint32_t pktSize)
-    {
-        m_remote = remote;
-        m_port = port;
-        m_interval = interval;
-        m_pktSize = std::max<uint32_t>(pktSize, 16u);
-    }
+  void Setup(Ipv4Address peerIp, uint16_t peerPort, Time interval, uint32_t payloadBytes, double measureStartS)
+  {
+    m_peerIp = peerIp;
+    m_peerPort = peerPort;
+    m_interval = interval;
+    m_payloadBytes = payloadBytes;
+    m_measureStartS = measureStartS;
+  }
 
 private:
-    void StartApplication() override
+  void StartApplication() override
+  {
+    m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_socket->Bind();
+    m_socket->Connect(InetSocketAddress(m_peerIp, m_peerPort));
+    m_socket->SetRecvCallback(MakeCallback(&UdpRttClientApp::HandleRead, this));
+
+    m_running = true;
+    m_seq = 0;
+    SendOne();
+  }
+
+  void StopApplication() override
+  {
+    m_running = false;
+    if (m_sendEvent.IsPending())
+      Simulator::Cancel(m_sendEvent);
+
+    if (m_socket)
     {
-        m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-        m_socket->Bind();
-        m_socket->SetRecvCallback(MakeCallback(&UdpEchoRttClient::HandleRead, this));
-
-        m_peer = InetSocketAddress(m_remote, m_port);
-        m_running = true;
-
-        // IMPORTANT: schedule only once; SendOnce() reschedules itself.
-        Simulator::ScheduleNow(&UdpEchoRttClient::SendOnce, this);
+      m_socket->Close();
+      m_socket = nullptr;
     }
+  }
 
-    void StopApplication() override
+  void ScheduleNext()
+  {
+    if (!m_running)
+      return;
+    m_sendEvent = Simulator::Schedule(m_interval, &UdpRttClientApp::SendOne, this);
+  }
+
+  void SendOne()
+  {
+    if (!m_running)
+      return;
+
+    RttHeader hdr;
+    hdr.SetSeq(m_seq++);
+    hdr.SetTsNs(Simulator::Now().GetNanoSeconds());
+
+    Ptr<Packet> p = Create<Packet>(m_payloadBytes);
+    p->AddHeader(hdr);
+
+    m_socket->Send(p);
+    ScheduleNext();
+  }
+
+  void HandleRead(Ptr<Socket> socket)
+  {
+    Address from;
+    while (Ptr<Packet> p = socket->RecvFrom(from))
     {
-        m_running = false;
-        if (m_sendEvent.IsPending())
-        {
-            Simulator::Cancel(m_sendEvent);
-        }
+      if (!p || p->GetSize() == 0)
+        continue;
 
-        if (m_socket)
-        {
-            m_socket->Close();
-            m_socket = nullptr;
-        }
+      RttHeader hdr;
+      p->RemoveHeader(hdr);
+
+      Time sent = NanoSeconds(static_cast<int64_t>(hdr.GetTsNs()));
+      Time rtt = Simulator::Now() - sent;
+
+      if (Simulator::Now().GetSeconds() >= m_measureStartS)
+      {
+        g_rttSumMs += rtt.GetMilliSeconds();
+        g_rttCount++;
+      }
     }
+  }
 
-    void SendOnce()
-    {
-        if (!m_running)
-        {
-            return;
-        }
+  Ptr<Socket> m_socket;
+  EventId m_sendEvent;
+  bool m_running{false};
 
-        Ptr<Packet> p = Create<Packet>(m_pktSize);
-        TxTimeHeader h(static_cast<uint64_t>(Simulator::Now().GetNanoSeconds()));
-        p->AddHeader(h);
-
-        m_socket->SendTo(p, 0, m_peer);
-        m_sendEvent = Simulator::Schedule(m_interval, &UdpEchoRttClient::SendOnce, this);
-    }
-
-    void HandleRead(Ptr<Socket> socket)
-    {
-        Address from;
-        Ptr<Packet> p = socket->RecvFrom(from);
-        while (p && p->GetSize() > 0)
-        {
-            TxTimeHeader h;
-            p->RemoveHeader(h);
-
-            const Time now = Simulator::Now();
-            if (now >= gMs.tStart && now <= gMs.tEnd)
-            {
-                const uint64_t txNs = h.GetTxTimeNs();
-                const int64_t nowNsSigned = now.GetNanoSeconds();
-                if (txNs > 0 && nowNsSigned >= 0)
-                {
-                    const uint64_t nowNs = static_cast<uint64_t>(nowNsSigned);
-                    if (nowNs >= txNs)
-                    {
-                        const double rttMs = static_cast<double>(nowNs - txNs) / 1e6;
-                        gMs.rttReplies++;
-                        gMs.rttSumMs += rttMs;
-                    }
-                }
-            }
-
-            if (socket->GetRxAvailable() <= 0)
-            {
-                break;
-            }
-            p = socket->RecvFrom(from);
-        }
-    }
-
-    Ptr<Socket> m_socket;
-    Address m_peer;
-
-    Ipv4Address m_remote;
-    uint16_t m_port{6000};
-    Time m_interval{Seconds(0.2)};
-    uint32_t m_pktSize{64};
-
-    bool m_running{false};
-    EventId m_sendEvent;
+  Ipv4Address m_peerIp;
+  uint16_t m_peerPort{0};
+  Time m_interval{MilliSeconds(200)};
+  uint32_t m_payloadBytes{16};
+  uint32_t m_seq{0};
+  double m_measureStartS{0.0};
 };
+
+// -------------------- UDP data TX/RX (goodput/delay/loss without FlowMonitor) --------------------
+class UdpDataTxApp : public Application
+{
+public:
+  void Setup(Ipv4Address peerIp,
+             uint16_t peerPort,
+             const DataRate &rate,
+             uint32_t packetSizeBytes,
+             double measureStartS)
+  {
+    m_peerIp = peerIp;
+    m_peerPort = peerPort;
+    m_rate = rate;
+    m_packetSizeBytes = packetSizeBytes;
+    m_measureStartS = measureStartS;
+  }
+
+  uint64_t GetSentPackets() const { return m_sentPackets; }
+  uint64_t GetSentBytes() const { return m_sentBytes; }
+
+private:
+  void StartApplication() override
+  {
+    m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_socket->Bind();
+    m_socket->Connect(InetSocketAddress(m_peerIp, m_peerPort));
+
+    m_running = true;
+    m_seq = 0;
+    ScheduleNext();
+  }
+
+  void StopApplication() override
+  {
+    m_running = false;
+    if (m_sendEvent.IsPending())
+      Simulator::Cancel(m_sendEvent);
+
+    if (m_socket)
+    {
+      m_socket->Close();
+      m_socket = nullptr;
+    }
+  }
+
+  void ScheduleNext()
+  {
+    if (!m_running)
+      return;
+
+    const uint64_t br = m_rate.GetBitRate();
+    if (br == 0)
+      return;
+
+    const double intervalS = (static_cast<double>(m_packetSizeBytes) * 8.0) / static_cast<double>(br);
+    m_sendEvent = Simulator::Schedule(Seconds(intervalS), &UdpDataTxApp::SendOne, this);
+  }
+
+  void SendOne()
+  {
+    if (!m_running)
+      return;
+
+    const uint32_t hdrSize = 12;
+    const uint32_t payload = (m_packetSizeBytes > hdrSize) ? (m_packetSizeBytes - hdrSize) : 0;
+
+    RttHeader hdr;
+    hdr.SetSeq(m_seq++);
+    hdr.SetTsNs(Simulator::Now().GetNanoSeconds());
+
+    Ptr<Packet> p = Create<Packet>(payload);
+    p->AddHeader(hdr);
+
+    int n = m_socket->Send(p);
+    if (n > 0)
+    {
+      if (Simulator::Now().GetSeconds() >= m_measureStartS)
+      {
+        m_sentPackets++;
+        m_sentBytes += static_cast<uint64_t>(n);
+      }
+    }
+
+    ScheduleNext();
+  }
+
+  Ptr<Socket> m_socket;
+  EventId m_sendEvent;
+  bool m_running{false};
+
+  Ipv4Address m_peerIp;
+  uint16_t m_peerPort{0};
+  DataRate m_rate{DataRate("1Mbps")};
+  uint32_t m_packetSizeBytes{1200};
+  double m_measureStartS{0.0};
+
+  uint32_t m_seq{0};
+  uint64_t m_sentPackets{0};
+  uint64_t m_sentBytes{0};
+};
+
+class UdpDataRxApp : public Application
+{
+public:
+  void Setup(uint16_t listenPort, double measureStartS)
+  {
+    m_listenPort = listenPort;
+    m_measureStartS = measureStartS;
+  }
+
+  uint64_t GetRxPackets() const { return m_rxPackets; }
+  uint64_t GetRxBytes() const { return m_rxBytes; }
+  uint64_t GetLostPacketsEstimate() const { return m_lostPackets; }
+  double GetAvgDelayMs() const
+  {
+    if (m_rxPackets == 0)
+      return -1.0;
+    return m_delaySumMs / static_cast<double>(m_rxPackets);
+  }
+
+private:
+  void StartApplication() override
+  {
+    m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+    m_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), m_listenPort));
+    m_socket->SetRecvCallback(MakeCallback(&UdpDataRxApp::HandleRead, this));
+  }
+
+  void StopApplication() override
+  {
+    if (m_socket)
+    {
+      m_socket->Close();
+      m_socket = nullptr;
+    }
+  }
+
+  void HandleRead(Ptr<Socket> socket)
+  {
+    Address from;
+    while (Ptr<Packet> p = socket->RecvFrom(from))
+    {
+      if (!p || p->GetSize() == 0)
+        continue;
+
+      if (Simulator::Now().GetSeconds() < m_measureStartS)
+        continue;
+
+      RttHeader hdr;
+      p->RemoveHeader(hdr);
+
+      const uint32_t seq = hdr.GetSeq();
+
+      if (!m_seenAny)
+      {
+        m_seenAny = true;
+        m_lastSeq = seq;
+      }
+      else
+      {
+        if (seq > m_lastSeq + 1)
+        {
+          m_lostPackets += static_cast<uint64_t>(seq - (m_lastSeq + 1));
+          m_lastSeq = seq;
+        }
+        else if (seq > m_lastSeq)
+        {
+          m_lastSeq = seq;
+        }
+      }
+
+      Time sent = NanoSeconds(static_cast<int64_t>(hdr.GetTsNs()));
+      Time delay = Simulator::Now() - sent;
+
+      m_rxPackets++;
+      m_rxBytes += p->GetSize() + 12;
+      m_delaySumMs += delay.GetMilliSeconds();
+    }
+  }
+
+  Ptr<Socket> m_socket;
+  uint16_t m_listenPort{0};
+  double m_measureStartS{0.0};
+
+  bool m_seenAny{false};
+  uint32_t m_lastSeq{0};
+
+  uint64_t m_rxPackets{0};
+  uint64_t m_rxBytes{0};
+  uint64_t m_lostPackets{0};
+  double m_delaySumMs{0.0};
+};
+
+// -------------------- optional attribute setter --------------------
+static void SetPhyAttributeIfExists(Ptr<WifiPhy> phy, const std::string &name, const AttributeValue &v)
+{
+  if (!phy)
+    return;
+  bool ok = phy->SetAttributeFailSafe(name, v);
+  (void)ok;
+}
+
+static uint16_t Wifi5GhzChannelToFreqMhz(int ch)
+{
+  if (ch <= 0)
+    return 5180;
+  return static_cast<uint16_t>(5000 + 5 * ch);
+}
+
+static void ConfigureOperatingChannel(Ptr<WifiNetDevice> dev, int channelNumber, uint16_t widthMhz)
+{
+  if (!dev)
+    return;
+
+  Ptr<WifiPhy> phy = dev->GetPhy();
+  if (!phy)
+    return;
+
+  const uint16_t freq = Wifi5GhzChannelToFreqMhz(channelNumber);
+
+  SetPhyAttributeIfExists(phy, "ChannelNumber", UintegerValue(static_cast<uint32_t>(channelNumber)));
+  SetPhyAttributeIfExists(phy, "ChannelWidth", UintegerValue(static_cast<uint32_t>(widthMhz)));
+  SetPhyAttributeIfExists(phy, "Frequency", UintegerValue(static_cast<uint32_t>(freq)));
+
+  std::ostringstream cs;
+  cs << "{"
+     << static_cast<uint32_t>(channelNumber) << ","
+     << static_cast<uint32_t>(freq) << ","
+     << static_cast<uint32_t>(widthMhz)
+     << "}";
+  SetPhyAttributeIfExists(phy, "ChannelSettings", StringValue(cs.str()));
+}
 
 int main(int argc, char *argv[])
 {
-    std::string outDir = "results/p9";
-    std::string ssidStr = "wifi-ter";
-    std::string transport = "udp";        // udp|tcp
-    std::string standardStr = "ax";       // ax|ac|n
-    std::string rateControl = "adaptive"; // adaptive|constant
-    std::string dataMode = "HeMcs7";
-    std::string propModel = "logdistance"; // logdistance|friis
+  std::string outDir = "results/p9_heatmap";
+  uint32_t seed = 1;
+  uint32_t run = 0;
 
-    double apX = 0.0, apY = 0.0;
-    double x = 1.0, y = 1.0;
+  double simTime = 8.0;
+  double appStart = 2.0;
 
-    double simTime = 7.0;
-    double appStart = 2.0;
-    double measureTime = 3.0;
+  double xMin = 0.0, xMax = 20.0;
+  double yMin = 0.0, yMax = 20.0;
 
-    uint32_t pktSize = 1200;
-    double udpRateMbps = 50.0;
-    uint64_t tcpMaxBytes = 0;
+  double apX = 10.0, apY = 10.0;
+  double x = 0.0, y = 0.0;
 
-    double rttInterval = 0.2;
-    uint16_t rttPort = 6000;
-    uint32_t rttPktSize = 64;
+  std::string wifiStandardStr = "ax";
+  std::string ssidStr = "heatmap";
 
-    double txPowerDbm = 20.0;
+  bool pcap = false;
 
-    // Do NOT set WifiPhy ChannelWidth via attributes in your ns-3.41 build.
-    uint32_t channelWidth = 20; // MHz (only for SNR estimate + CSV)
-    double freqMHz = 5180.0;
+  uint16_t channelWidthMhz = 20;
+  int chan = 36;
 
-    double refDistance = 1.0;
-    double refLossDb = 46.6777;
-    double exponent = 3.0;
+  double txPowerDbm = 16.0;
+  double noiseFigureDb = 7.0;
 
-    double noiseFigureDb = 7.0;
+  double logExp = 3.0;
+  double shadowingSigmaDb = 4.0;
+  bool enableFading = false;
 
-    bool pcap = false;
-    bool flowmon = false;
+  uint32_t pktSize = 1200;
+  std::string udpRate = "20Mbps";
+  uint16_t udpPort = 9000;
 
-    uint32_t seed = 1;
-    uint32_t run = 1;
+  bool enableRtt = true;
+  uint16_t rttPort = 9100;
+  uint32_t rttIntervalMs = 200;
+  uint32_t rttPayloadBytes = 16;
 
-    CommandLine cmd;
-    cmd.AddValue("outDir", "Output directory", outDir);
-    cmd.AddValue("ssid", "Wi-Fi SSID", ssidStr);
-    cmd.AddValue("transport", "udp|tcp", transport);
-    cmd.AddValue("standard", "ax|ac|n", standardStr);
-    cmd.AddValue("rateControl", "adaptive|constant", rateControl);
-    cmd.AddValue("dataMode", "ConstantRate Wifi DataMode", dataMode);
-    cmd.AddValue("propModel", "logdistance|friis", propModel);
+  CommandLine cmd;
+  cmd.AddValue("outDir", "Output directory", outDir);
+  cmd.AddValue("seed", "RNG seed", seed);
+  cmd.AddValue("run", "RNG run id", run);
 
-    cmd.AddValue("apX", "AP X", apX);
-    cmd.AddValue("apY", "AP Y", apY);
-    cmd.AddValue("x", "STA X", x);
-    cmd.AddValue("y", "STA Y", y);
+  cmd.AddValue("simTime", "Total simulation time (s)", simTime);
+  cmd.AddValue("appStart", "Traffic start time (s)", appStart);
 
-    cmd.AddValue("simTime", "Simulation time (s)", simTime);
-    cmd.AddValue("appStart", "App start (s)", appStart);
-    cmd.AddValue("measureTime", "Measure window (s)", measureTime);
+  cmd.AddValue("xMin", "Area min X (m)", xMin);
+  cmd.AddValue("xMax", "Area max X (m)", xMax);
+  cmd.AddValue("yMin", "Area min Y (m)", yMin);
+  cmd.AddValue("yMax", "Area max Y (m)", yMax);
 
-    cmd.AddValue("pktSize", "Packet size", pktSize);
-    cmd.AddValue("udpRateMbps", "UDP offered rate (Mbps)", udpRateMbps);
-    cmd.AddValue("tcpMaxBytes", "TCP max bytes", tcpMaxBytes);
+  cmd.AddValue("apX", "AP X position (m)", apX);
+  cmd.AddValue("apY", "AP Y position (m)", apY);
 
-    cmd.AddValue("rttInterval", "RTT probe interval (s)", rttInterval);
-    cmd.AddValue("rttPort", "RTT probe port", rttPort);
-    cmd.AddValue("rttPktSize", "RTT probe pkt size", rttPktSize);
+  cmd.AddValue("x", "Probe STA X position (m)", x);
+  cmd.AddValue("y", "Probe STA Y position (m)", y);
 
-    cmd.AddValue("txPowerDbm", "Tx power (dBm)", txPowerDbm);
-    cmd.AddValue("channelWidth", "Channel width for SNR estimate only (MHz)", channelWidth);
-    cmd.AddValue("freqMHz", "Frequency for Friis estimate (MHz)", freqMHz);
+  cmd.AddValue("wifiStandard", "Wi-Fi standard: ax|ac|n", wifiStandardStr);
+  cmd.AddValue("ssid", "SSID", ssidStr);
 
-    cmd.AddValue("refDistance", "LogDistance ref distance", refDistance);
-    cmd.AddValue("refLossDb", "LogDistance ref loss", refLossDb);
-    cmd.AddValue("exponent", "LogDistance exponent", exponent);
+  cmd.AddValue("pcap", "Enable PCAP", pcap);
 
-    cmd.AddValue("noiseFigureDb", "Noise figure (dB)", noiseFigureDb);
+  cmd.AddValue("channelWidth", "Channel width (MHz)", channelWidthMhz);
+  cmd.AddValue("chan", "5GHz channel number label (e.g., 36)", chan);
 
-    cmd.AddValue("pcap", "Enable PCAP", pcap);
-    cmd.AddValue("flowmon", "Enable FlowMonitor", flowmon);
-    cmd.AddValue("seed", "RNG seed", seed);
-    cmd.AddValue("run", "RNG run", run);
+  cmd.AddValue("txPowerDbm", "Tx power (dBm)", txPowerDbm);
+  cmd.AddValue("noiseFigureDb", "Rx noise figure (dB)", noiseFigureDb);
 
-    cmd.Parse(argc, argv);
+  cmd.AddValue("logExp", "LogDistance exponent", logExp);
+  cmd.AddValue("shadowingSigmaDb", "Shadowing sigma (dB)", shadowingSigmaDb);
+  cmd.AddValue("enableFading", "Enable Nakagami fading", enableFading);
 
-    transport = ToLower(transport);
-    rateControl = ToLower(rateControl);
-    propModel = ToLower(propModel);
+  cmd.AddValue("pktSize", "UDP packet size (bytes)", pktSize);
+  cmd.AddValue("udpRate", "UDP offered load (server->STA)", udpRate);
+  cmd.AddValue("udpPort", "UDP port", udpPort);
 
-    // --- Heatmap sanity: avoid saturating the link (flat goodput + huge loss) ---
-    if (transport == "udp" && udpRateMbps > 20.0)
+  cmd.AddValue("enableRtt", "Enable UDP RTT measurement", enableRtt);
+  cmd.AddValue("rttPort", "UDP RTT port", rttPort);
+  cmd.AddValue("rttIntervalMs", "RTT probe interval (ms)", rttIntervalMs);
+  cmd.AddValue("rttPayloadBytes", "RTT probe payload bytes (without header)", rttPayloadBytes);
+
+  cmd.Parse(argc, argv);
+
+  if (simTime <= appStart)
+  {
+    NS_LOG_UNCOND("ERROR: simTime must be > appStart");
+    return 1;
+  }
+
+  RngSeedManager::SetSeed(seed);
+  RngSeedManager::SetRun(run);
+
+  EnsureDir(outDir);
+  EnsureDir(outDir + "/raw");
+  EnsureDir(outDir + "/logs");
+  EnsureDir(outDir + "/pcap");
+  EnsureDir(outDir + "/plots");
+  EnsureDir(outDir + "/report");
+
+  const std::string gridPath = outDir + "/raw/grid.csv";
+  const std::string gridHeader = "x,y,seed,run,rssi_dbm,snr_db,goodput_mbps,rtt_ms,delay_ms,loss";
+  EnsureCsvHeader(gridPath, gridHeader);
+
+  NodeContainer apNode;
+  apNode.Create(1);
+
+  NodeContainer staNode;
+  staNode.Create(1);
+
+  NodeContainer serverNode;
+  serverNode.Create(1);
+
+  Ptr<Node> ap = apNode.Get(0);
+  Ptr<Node> sta = staNode.Get(0);
+  Ptr<Node> server = serverNode.Get(0);
+
+  MobilityHelper mobility;
+  mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+  mobility.Install(apNode);
+  mobility.Install(staNode);
+  mobility.Install(serverNode);
+
+  ap->GetObject<MobilityModel>()->SetPosition(Vector(apX, apY, 0.0));
+  sta->GetObject<MobilityModel>()->SetPosition(Vector(x, y, 0.0));
+  server->GetObject<MobilityModel>()->SetPosition(Vector(apX, apY, 0.0));
+
+  Ptr<LogDistancePropagationLossModel> logd = CreateObject<LogDistancePropagationLossModel>();
+  logd->SetAttribute("Exponent", DoubleValue(logExp));
+  logd->SetAttribute("ReferenceDistance", DoubleValue(1.0));
+  logd->SetAttribute("ReferenceLoss", DoubleValue(46.6777));
+
+  Ptr<NormalRandomVariable> normal = CreateObject<NormalRandomVariable>();
+  normal->SetAttribute("Mean", DoubleValue(0.0));
+  normal->SetAttribute("Variance", DoubleValue(shadowingSigmaDb * shadowingSigmaDb));
+
+  Ptr<RandomPropagationLossModel> shadow = CreateObject<RandomPropagationLossModel>();
+  shadow->SetAttribute("Variable", PointerValue(normal));
+  logd->SetNext(shadow);
+
+  if (enableFading)
+  {
+    Ptr<NakagamiPropagationLossModel> nak = CreateObject<NakagamiPropagationLossModel>();
+    nak->SetAttribute("Distance1", DoubleValue(5.0));
+    nak->SetAttribute("Distance2", DoubleValue(15.0));
+    nak->SetAttribute("m0", DoubleValue(1.5));
+    nak->SetAttribute("m1", DoubleValue(1.0));
+    nak->SetAttribute("m2", DoubleValue(0.75));
+    shadow->SetNext(nak);
+  }
+
+  Ptr<YansWifiChannel> wifiChannel = CreateObject<YansWifiChannel>();
+  wifiChannel->SetPropagationDelayModel(CreateObject<ConstantSpeedPropagationDelayModel>());
+  wifiChannel->SetPropagationLossModel(logd);
+
+  WifiHelper wifi;
+  wifi.SetStandard(ParseStandard(wifiStandardStr));
+  wifi.SetRemoteStationManager("ns3::MinstrelHtWifiManager");
+
+  YansWifiPhyHelper phy;
+  phy.SetChannel(wifiChannel);
+  phy.Set("TxPowerStart", DoubleValue(txPowerDbm));
+  phy.Set("TxPowerEnd", DoubleValue(txPowerDbm));
+  phy.Set("TxPowerLevels", UintegerValue(1));
+  phy.Set("RxNoiseFigure", DoubleValue(noiseFigureDb));
+
+  WifiMacHelper mac;
+  Ssid ssid(ssidStr);
+
+  mac.SetType("ns3::ApWifiMac",
+              "Ssid", SsidValue(ssid),
+              "BeaconInterval", TimeValue(MicroSeconds(1024 * 100)));
+  NetDeviceContainer apDev = wifi.Install(phy, mac, ap);
+
+  mac.SetType("ns3::StaWifiMac",
+              "Ssid", SsidValue(ssid),
+              "ActiveProbing", BooleanValue(true));
+  NetDeviceContainer staDev = wifi.Install(phy, mac, staNode);
+
+  ConfigureOperatingChannel(DynamicCast<WifiNetDevice>(apDev.Get(0)), chan, channelWidthMhz);
+  ConfigureOperatingChannel(DynamicCast<WifiNetDevice>(staDev.Get(0)), chan, channelWidthMhz);
+
+  CsmaHelper csma;
+  csma.SetChannelAttribute("DataRate", StringValue("1Gbps"));
+  csma.SetChannelAttribute("Delay", TimeValue(MicroSeconds(50)));
+
+  NodeContainer csmaNodes;
+  csmaNodes.Add(ap);
+  csmaNodes.Add(server);
+
+  NetDeviceContainer csmaDevs = csma.Install(csmaNodes);
+
+  InternetStackHelper internet;
+  internet.Install(apNode);
+  internet.Install(staNode);
+  internet.Install(serverNode);
+
+  Ipv4AddressHelper ipv4;
+
+  ipv4.SetBase("10.1.0.0", "255.255.255.0");
+  Ipv4InterfaceContainer apWifiIf = ipv4.Assign(apDev);
+  Ipv4InterfaceContainer staWifiIf = ipv4.Assign(staDev);
+
+  ipv4.SetBase("10.2.0.0", "255.255.255.0");
+  Ipv4InterfaceContainer csmaIf = ipv4.Assign(csmaDevs);
+
+  Ipv4Address staIp = staWifiIf.GetAddress(0);
+  Ipv4Address serverIp = csmaIf.GetAddress(1);
+  Ipv4Address apWifiIp = apWifiIf.GetAddress(0);
+
+  ap->GetObject<Ipv4>()->SetAttribute("IpForward", BooleanValue(true));
+  Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+  Ipv4StaticRoutingHelper staticRouting;
+  Ptr<Ipv4> staIpv4 = sta->GetObject<Ipv4>();
+  uint32_t staIfIndex = staIpv4->GetInterfaceForDevice(staDev.Get(0));
+  Ptr<Ipv4StaticRouting> staSr = staticRouting.GetStaticRouting(staIpv4);
+  staSr->SetDefaultRoute(apWifiIp, staIfIndex);
+
+  g_measureStartS = appStart;
+
+  Ptr<WifiNetDevice> staWifi = DynamicCast<WifiNetDevice>(staDev.Get(0));
+  if (staWifi && staWifi->GetPhy())
+  {
+    staWifi->GetPhy()->TraceConnectWithoutContext("MonitorSnifferRx",
+                                                  MakeCallback(&MonitorSnifferRxTrace));
+  }
+
+  Ptr<UdpDataRxApp> dataRx = CreateObject<UdpDataRxApp>();
+  dataRx->Setup(udpPort, appStart);
+  sta->AddApplication(dataRx);
+  dataRx->SetStartTime(Seconds(appStart));
+  dataRx->SetStopTime(Seconds(simTime));
+
+  Ptr<UdpDataTxApp> dataTx = CreateObject<UdpDataTxApp>();
+  dataTx->Setup(staIp, udpPort, DataRate(udpRate), pktSize, appStart);
+  server->AddApplication(dataTx);
+  dataTx->SetStartTime(Seconds(appStart));
+  dataTx->SetStopTime(Seconds(simTime));
+
+  if (enableRtt)
+  {
+    Ptr<UdpRttServerApp> rttServer = CreateObject<UdpRttServerApp>();
+    rttServer->Setup(rttPort);
+    server->AddApplication(rttServer);
+    rttServer->SetStartTime(Seconds(appStart));
+    rttServer->SetStopTime(Seconds(simTime));
+
+    Ptr<UdpRttClientApp> rttClient = CreateObject<UdpRttClientApp>();
+    rttClient->Setup(serverIp, rttPort, MilliSeconds(rttIntervalMs), rttPayloadBytes, appStart);
+    sta->AddApplication(rttClient);
+    rttClient->SetStartTime(Seconds(appStart));
+    rttClient->SetStopTime(Seconds(simTime));
+  }
+
+  if (pcap)
+  {
+    phy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
+    phy.EnablePcap(outDir + "/pcap/p9_ap", apDev.Get(0), true);
+    phy.EnablePcap(outDir + "/pcap/p9_sta", staDev.Get(0), true);
+    csma.EnablePcap(outDir + "/pcap/p9_csma", csmaDevs, true);
+  }
+
+  Simulator::Stop(Seconds(simTime));
+  Simulator::Run();
+
+  double rssiAvgDbm = -1.0;
+  double snrAvgDb = -1.0;
+  if (g_rssiCount > 0)
+  {
+    rssiAvgDbm = g_rssiSumDbm / static_cast<double>(g_rssiCount);
+    snrAvgDb = g_snrSumDb / static_cast<double>(g_rssiCount);
+  }
+
+  double rttAvgMs = -1.0;
+  if (enableRtt && g_rttCount > 0)
+  {
+    rttAvgMs = g_rttSumMs / static_cast<double>(g_rttCount);
+  }
+
+  const double dur = simTime - appStart;
+  const uint64_t txPkts = dataTx->GetSentPackets();
+  const uint64_t rxPkts = dataRx->GetRxPackets();
+  const uint64_t rxBytes = dataRx->GetRxBytes();
+  const uint64_t lostEst = dataRx->GetLostPacketsEstimate();
+
+  double goodputMbps = -1.0;
+  if (dur > 0.0)
+    goodputMbps = (static_cast<double>(rxBytes) * 8.0) / (dur * 1e6);
+
+  double delayMs = dataRx->GetAvgDelayMs();
+
+  double loss = -1.0;
+  if (txPkts > 0)
+  {
+    const uint64_t missing = (txPkts >= rxPkts) ? (txPkts - rxPkts) : 0;
+    (void)lostEst;
+    loss = static_cast<double>(missing) / static_cast<double>(txPkts);
+  }
+
+  {
+    std::ofstream f(gridPath, std::ios::app);
+    if (f.is_open())
     {
-        NS_LOG_UNCOND("WARN: udpRateMbps is high (" << udpRateMbps
-                                                    << " Mbps). Heatmap may saturate. "
-                                                    << "Try 5-20 Mbps for meaningful coverage heatmap.");
-        // Optional auto-cap:
-        // udpRateMbps = 20.0;
+      f << std::fixed << std::setprecision(6)
+        << x << ","
+        << y << ","
+        << seed << ","
+        << run << ","
+        << rssiAvgDbm << ","
+        << snrAvgDb << ","
+        << goodputMbps << ","
+        << rttAvgMs << ","
+        << delayMs << ","
+        << loss
+        << "\n";
     }
+  }
 
-    RngSeedManager::SetSeed(seed);
-    RngSeedManager::SetRun(run);
-
-    EnsureDir(outDir);
-    EnsureDir(outDir + "/raw");
-    EnsureDir(outDir + "/logs");
-    EnsureDir(outDir + "/plots");
-    EnsureDir(outDir + "/heatmaps");
-
-    const std::string heatCsv = outDir + "/heatmaps/heatmap.csv";
-    const std::string header =
-        "x,y,associated,offered_mbps,goodput_mbps,avg_rtt_ms,rtt_replies,tx_bytes,rx_bytes,loss_ratio,"
-        "rssi_est_dbm,snr_est_db,seed,run,standard,transport,rateControl,channelWidth";
-    EnsureCsvHeader(heatCsv, header);
-
-    // --- Project-required grid.csv (one line per point) ---
-    const std::string gridCsv = outDir + "/raw/grid.csv";
-    const std::string gridHeader =
-        "x,y,seed,run,rssi_dbm,snr_db,goodput_mbps,rtt_ms,delay_ms,loss";
-    EnsureCsvHeader(gridCsv, gridHeader);
-
-    // -------------------- nodes --------------------
-    NodeContainer wifiSta;
-    wifiSta.Create(1);
-    NodeContainer wifiAp;
-    wifiAp.Create(1);
-    NodeContainer server;
-    server.Create(1);
-
-    // -------------------- mobility --------------------
-    MobilityHelper mobility;
-    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    mobility.Install(wifiAp);
-    mobility.Install(wifiSta);
-    mobility.Install(server);
-
-    wifiAp.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(apX, apY, 0.0));
-    wifiSta.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(x, y, 0.0));
-    server.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(apX, apY - 5.0, 0.0));
-
-    // -------------------- CSMA (AP <-> Server) --------------------
-    CsmaHelper csma;
-    csma.SetChannelAttribute("DataRate", StringValue("100Mbps"));
-    csma.SetChannelAttribute("Delay", TimeValue(MilliSeconds(1)));
-
-    NodeContainer csmaNodes;
-    csmaNodes.Add(wifiAp.Get(0));
-    csmaNodes.Add(server.Get(0));
-    NetDeviceContainer csmaDevs = csma.Install(csmaNodes);
-
-    // -------------------- Wi-Fi --------------------
-    WifiHelper wifi;
-    wifi.SetStandard(ParseStandard(standardStr));
-
-    if (rateControl == "constant")
-    {
-        wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                     "DataMode", StringValue(dataMode),
-                                     "ControlMode", StringValue(dataMode));
-    }
-    else
-    {
-        wifi.SetRemoteStationManager("ns3::MinstrelHtWifiManager");
-    }
-
-    Ptr<YansWifiChannel> wifiChannel = CreateObject<YansWifiChannel>();
-    wifiChannel->SetPropagationDelayModel(CreateObject<ConstantSpeedPropagationDelayModel>());
-
-    if (propModel == "friis" || propModel == "freespace")
-    {
-        wifiChannel->SetPropagationLossModel(CreateObject<FriisPropagationLossModel>());
-    }
-    else
-    {
-        Ptr<LogDistancePropagationLossModel> loss = CreateObject<LogDistancePropagationLossModel>();
-        loss->SetAttribute("ReferenceDistance", DoubleValue(refDistance));
-        loss->SetAttribute("ReferenceLoss", DoubleValue(refLossDb));
-        loss->SetAttribute("Exponent", DoubleValue(exponent));
-        wifiChannel->SetPropagationLossModel(loss);
-    }
-
-    YansWifiPhyHelper phy;
-    phy.SetChannel(wifiChannel);
-    phy.Set("TxPowerStart", DoubleValue(txPowerDbm));
-    phy.Set("TxPowerEnd", DoubleValue(txPowerDbm));
-    // DO NOT set ChannelWidth here (your build NS_FATALs).
-
-    WifiMacHelper mac;
-    Ssid ssid = Ssid(ssidStr);
-
-    mac.SetType("ns3::ApWifiMac",
-                "Ssid", SsidValue(ssid),
-                "QosSupported", BooleanValue(true));
-    NetDeviceContainer apDev = wifi.Install(phy, mac, wifiAp);
-
-    mac.SetType("ns3::StaWifiMac",
-                "Ssid", SsidValue(ssid),
-                "ActiveProbing", BooleanValue(false),
-                "QosSupported", BooleanValue(true));
-    NetDeviceContainer staDev = wifi.Install(phy, mac, wifiSta);
-
-    if (pcap)
-    {
-        phy.EnablePcap(outDir + "/raw/p9_sta", staDev.Get(0));
-        phy.EnablePcap(outDir + "/raw/p9_ap", apDev.Get(0));
-        csma.EnablePcap(outDir + "/raw/p9_csma", csmaDevs, true);
-    }
-
-    // -------------------- Internet stack & IP --------------------
-    InternetStackHelper internet;
-    internet.Install(wifiSta);
-    internet.Install(wifiAp);
-    internet.Install(server);
-
-    Ipv4AddressHelper wifiIp;
-    wifiIp.SetBase("10.1.0.0", "255.255.255.0");
-    wifiIp.Assign(staDev);
-    wifiIp.Assign(apDev);
-
-    Ipv4AddressHelper csmaIp;
-    csmaIp.SetBase("10.2.0.0", "255.255.255.0");
-    Ipv4InterfaceContainer csmaIf = csmaIp.Assign(csmaDevs);
-
-    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
-
-    // -------------------- Apps: data sink --------------------
-    const uint16_t port = 5000;
-    Address sinkAddr(InetSocketAddress(csmaIf.GetAddress(1), port));
-
-    PacketSinkHelper sinkHelper("ns3::UdpSocketFactory", sinkAddr);
-    if (transport == "tcp")
-    {
-        sinkHelper = PacketSinkHelper("ns3::TcpSocketFactory", sinkAddr);
-    }
-
-    ApplicationContainer sinkApp = sinkHelper.Install(server.Get(0));
-    sinkApp.Start(Seconds(0.0));
-    sinkApp.Stop(Seconds(simTime));
-    Ptr<PacketSink> sink = DynamicCast<PacketSink>(sinkApp.Get(0));
-
-    // -------------------- Apps: data source --------------------
-    ApplicationContainer clientApps;
-    if (transport == "udp")
-    {
-        OnOffHelper onoff("ns3::UdpSocketFactory", sinkAddr);
-        onoff.SetAttribute("PacketSize", UintegerValue(pktSize));
-        onoff.SetAttribute("DataRate", DataRateValue(DataRate(std::to_string(udpRateMbps) + "Mbps")));
-        onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
-        onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-
-        clientApps = onoff.Install(wifiSta.Get(0));
-        clientApps.Start(Seconds(appStart));
-        clientApps.Stop(Seconds(simTime));
-        clientApps.Get(0)->TraceConnectWithoutContext("Tx", MakeCallback(&OnAppTx));
-    }
-    else
-    {
-        BulkSendHelper bulk("ns3::TcpSocketFactory", sinkAddr);
-        bulk.SetAttribute("MaxBytes", UintegerValue(tcpMaxBytes));
-
-        clientApps = bulk.Install(wifiSta.Get(0));
-        clientApps.Start(Seconds(appStart));
-        clientApps.Stop(Seconds(simTime));
-        clientApps.Get(0)->TraceConnectWithoutContext("Tx", MakeCallback(&OnAppTx));
-    }
-
-    // -------------------- RTT probe server/client --------------------
-    Ptr<UdpEchoRttServer> rttSrv = CreateObject<UdpEchoRttServer>();
-    rttSrv->Setup(rttPort);
-    server.Get(0)->AddApplication(rttSrv);
-    rttSrv->SetStartTime(Seconds(0.0));
-    rttSrv->SetStopTime(Seconds(simTime));
-
-    Ptr<UdpEchoRttClient> rttCli = CreateObject<UdpEchoRttClient>();
-    rttCli->Setup(csmaIf.GetAddress(1), rttPort, Seconds(rttInterval), rttPktSize);
-    wifiSta.Get(0)->AddApplication(rttCli);
-    rttCli->SetStartTime(Seconds(appStart + 0.1));
-    rttCli->SetStopTime(Seconds(simTime));
-
-    // -------------------- FlowMonitor (optional) --------------------
-    Ptr<FlowMonitor> monitor;
-    FlowMonitorHelper fmHelper;
-    if (flowmon)
-    {
-        monitor = fmHelper.InstallAll();
-    }
-
-    // -------------------- measurement window --------------------
-    gMs.Reset();
-    gMs.tStart = Seconds(appStart);
-    gMs.tEnd = Seconds(appStart + measureTime);
-
-    Simulator::Schedule(gMs.tStart, &MarkSinkRxStart, sink);
-    Simulator::Schedule(gMs.tEnd, &MarkSinkRxEnd, sink);
-
-    Simulator::Stop(Seconds(simTime));
-    Simulator::Run();
-
-    if (flowmon && monitor)
-    {
-        monitor->CheckForLostPackets();
-        std::ostringstream fn;
-        fn << outDir << "/raw/flowmon_p9_x" << std::fixed << std::setprecision(1) << x
-           << "_y" << y << "_run" << run << ".xml";
-        monitor->SerializeToXmlFile(fn.str(), true, true);
-    }
-
-    Simulator::Destroy();
-
-    // -------------------- metrics --------------------
-    const uint64_t rxBytesWindow =
-        (gMs.sinkRxEnd >= gMs.sinkRxStart) ? (gMs.sinkRxEnd - gMs.sinkRxStart) : 0;
-
-    const double goodputMbps =
-        (measureTime > 0.0) ? (static_cast<double>(rxBytesWindow) * 8.0 / (measureTime * 1e6)) : 0.0;
-
-    const double offeredMbps =
-        (measureTime > 0.0) ? (static_cast<double>(gMs.txBytesWindow) * 8.0 / (measureTime * 1e6)) : 0.0;
-
-    const double avgRttMs =
-        (gMs.rttReplies > 0) ? (gMs.rttSumMs / static_cast<double>(gMs.rttReplies)) : -1.0;
-
-    const double lossRatio =
-        (gMs.txBytesWindow > 0)
-            ? std::max(0.0, std::min(1.0, 1.0 - (static_cast<double>(rxBytesWindow) /
-                                                 static_cast<double>(gMs.txBytesWindow))))
-            : -1.0;
-
-    // association (real STA association state if available)
-    bool associated = false;
-    Ptr<WifiNetDevice> wnd = DynamicCast<WifiNetDevice>(staDev.Get(0));
-    if (wnd)
-    {
-        Ptr<WifiMac> wmac = wnd->GetMac();
-        Ptr<StaWifiMac> staMac = DynamicCast<StaWifiMac>(wmac);
-        if (staMac)
-        {
-            associated = staMac->IsAssociated();
-        }
-    }
-    // fallback if cast fails
-    if (!associated)
-    {
-        associated = (rxBytesWindow > 0) || (gMs.rttReplies > 0);
-    }
-
-    const double d = Distance2d(apX, apY, x, y);
-    const double rssiEstDbm =
-        EstimateRxPowerDbm(propModel, txPowerDbm, d, refDistance, refLossDb, exponent, freqMHz);
-
-    const double bwHz = static_cast<double>(channelWidth) * 1e6;
-    const double noiseDbm = ThermalNoiseDbm(bwHz, noiseFigureDb);
-    const double snrEstDb = rssiEstDbm - noiseDbm;
-
-    // -------------------- append CSV --------------------
-    std::ofstream f(heatCsv.c_str(), std::ios::app);
-    if (!f.is_open())
-    {
-        NS_LOG_UNCOND("ERROR: cannot open " << heatCsv);
-        return 1;
-    }
-
-    f << std::fixed << std::setprecision(6)
-      << x << ","
-      << y << ","
-      << (associated ? 1 : 0) << ","
-      << offeredMbps << ","
-      << goodputMbps << ","
-      << avgRttMs << ","
-      << gMs.rttReplies << ","
-      << gMs.txBytesWindow << ","
-      << rxBytesWindow << ","
-      << lossRatio << ","
-      << rssiEstDbm << ","
-      << snrEstDb << ","
-      << seed << ","
-      << run << ","
-      << ToLower(standardStr) << ","
-      << transport << ","
-      << rateControl << ","
-      << channelWidth
-      << "\n";
-    f.close();
-
-    NS_LOG_UNCOND("P9 point (" << x << "," << y << ") assoc=" << (associated ? 1 : 0)
-                               << " offered=" << offeredMbps << " Mbps"
-                               << " goodput=" << goodputMbps << " Mbps"
-                               << " rtt=" << avgRttMs << " ms");
-
-    // --- append project grid.csv line (safe: per-run outDir, no race in parallel) ---
-    // delay_ms: اگر delay جداگانه اندازه نگرفتی، -1 بگذار (طبق PDF مجاز است)
-    const double delayMs = -1.0; // or NaN if you prefer: std::numeric_limits<double>::quiet_NaN()
-
-    std::ofstream g(gridCsv.c_str(), std::ios::app);
-    if (!g.is_open())
-    {
-        NS_LOG_UNCOND("ERROR: cannot open " << gridCsv);
-        return 1;
-    }
-
-    g << std::fixed << std::setprecision(6)
-      << x << ","
-      << y << ","
-      << seed << ","
-      << run << ","
-      << rssiEstDbm << ","
-      << snrEstDb << ","
-      << goodputMbps << ","
-      << avgRttMs << ","
-      << delayMs << ","
-      << lossRatio
-      << "\n";
-    g.close();
-
-    return 0;
+  Simulator::Destroy();
+  return 0;
 }
