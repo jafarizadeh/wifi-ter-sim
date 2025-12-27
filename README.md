@@ -1,4 +1,4 @@
-````
+
 # WIFI-TER-SIM — Reproducible ns-3 Wi-Fi Experiment Suite (Parts 1–8)
 
 ## 1. Purpose and Scientific Scope
@@ -9,7 +9,7 @@ The project is organized into **eight parts (Part 1 to Part 8)**. Each part cons
 - a **C++ ns-3 scenario** (`scenarios/pX_*.cc`)
 - a **Bash runner script** (`scripts/run_pX.sh`) implementing the experimental protocol
 - a **Python plotting script** (`scripts/plot_pX.py`) to visualize outputs using:
-  ```bash
+```bash
   python3 scripts/plot_pX.py
 ````
 
