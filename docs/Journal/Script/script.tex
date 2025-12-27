@@ -1,0 +1,171 @@
+\documentclass[12pt,a4paper]{article}
+
+% --------------------------------------------------
+% Encoding and language
+% --------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[english]{babel}
+
+% --------------------------------------------------
+% Page layout
+% --------------------------------------------------
+\usepackage{geometry}
+\geometry{
+  a4paper,
+  left=30mm,
+  right=30mm,
+  top=30mm,
+  bottom=30mm
+}
+
+% --------------------------------------------------
+% Mathematics and symbols
+% --------------------------------------------------
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+
+% --------------------------------------------------
+% Tables and figures
+% --------------------------------------------------
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+
+% --------------------------------------------------
+% Code and verbatim text
+% --------------------------------------------------
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{verbatim}
+
+% --------------------------------------------------
+% Hyperlinks and references
+% --------------------------------------------------
+\usepackage[hidelinks]{hyperref}
+
+% --------------------------------------------------
+% Section formatting
+% --------------------------------------------------
+\usepackage{titlesec}
+\titleformat{\section}
+  {\normalfont\Large\bfseries}
+  {\thesection}{1em}{}
+\titleformat{\subsection}
+  {\normalfont\large\bfseries}
+  {\thesubsection}{1em}{}
+
+% --------------------------------------------------
+% Paragraph formatting
+% --------------------------------------------------
+\usepackage{setspace}
+\onehalfspacing
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.8em}
+
+% --------------------------------------------------
+% Listings configuration (for Bash / code references)
+% --------------------------------------------------
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+% --------------------------------------------------
+% Title information
+% --------------------------------------------------
+\title{\textbf{Scientific Design of a Runner Script for ns-3 Experiments}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+In ns-3 projects (whether as a university assignment or a research-oriented project), writing the C++ simulation program is only ``half the job.'' The other half consists of building a \textbf{stable workflow} that can repeatedly execute an experiment under different parameter combinations and ultimately produce data that are \textbf{clean, reproducible, traceable, and analyzable}. A runner script (typically written in Bash) implements this workflow in executable form; therefore, it is not merely a convenience tool, but rather an ``experimental protocol'' encoded as an executable process and considered part of the project deliverables.
+
+From a scientific perspective, such scripts address three fundamental requirements:
+
+\begin{itemize}
+  \item \textbf{Repeatability}: the same command must produce output in the same format, with explicit control over seeds, runs, and parameters.
+  \item \textbf{Traceability}: every output must be attributable to a unique configuration, and logs must allow auditing of failures or unexpected behaviors.
+  \item \textbf{Experimental hygiene}: old data must not silently mix with new data, and concurrent executions must not corrupt shared files.
+\end{itemize}
+
+The standard execution model can be described as a pipeline: optional cleanup of previous outputs, staging the scenario into \texttt{ns-3/scratch}, building (usually once), executing the sweep (serially or in parallel) with isolated outputs per run, merging single-run outputs, and, if necessary, removing temporary directories. This pipeline follows best practices for computational experiments and prevents common sources of generating invalid results.
+
+\section{Separation of Artifacts and Folder Structure}
+
+The foundation of experimental reliability is an orderly folder design that clearly separates \emph{source artifacts} from \emph{generated artifacts}. Sources (the \texttt{.cc} scenarios and the runner scripts themselves) are stable and version-controlled, whereas outputs (CSV files, logs, PCAP files, and FlowMonitor XML files) are generated artifacts and should not be mixed with code. Mixing them leads to repository clutter, accidental overwrites, and unintended submission of large output files.
+
+A common and reliable pattern is to place each project's outputs under \texttt{results/pX/} and divide them into several standard subdirectories:
+
+\begin{itemize}
+  \item \texttt{raw/} for analyzable data (primary experimental evidence such as time series, summary metrics, and traces),
+  \item \texttt{logs/} for build logs and per-run execution logs (the experiment notebook and evidence of actual execution),
+  \item \texttt{plots/} for derived outputs (even if plotting is performed later, a designated location is defined),
+  \item \texttt{tmp\_runs/} for storing isolated outputs of each run (the most critical component for correct parallelization).
+\end{itemize}
+
+\section{Isolation and Parallel Execution}
+
+The fundamental problem in parallel execution is that if multiple runs write their outputs into the same directory, they are no longer independent. Files may be overwritten, multiple processes may append concurrently to the same CSV file, or mixed and non-deterministic outputs may be produced. This is not merely a technical bug; from a methodological standpoint, it destroys traceability.
+
+Therefore, a standard runner must treat each run as a self-contained unit that writes its outputs to a dedicated \texttt{outDir}. Instead of writing all runs directly into \texttt{results/p8/raw/}, the script creates directories such as \texttt{results/p8/tmp\_runs/p8\_ON\_be40\_s1\_r3/} and sets \texttt{outDir} accordingly. After all runs have completed, the required files are merged into the final datasets under \texttt{results/p8/raw/}. This follows the practical principle of ``isolate first, then aggregate.''
+
+\section{Scenario Staging}
+
+In many projects, the reference version of a scenario is stored in \texttt{scenarios/}, while ns-3 executes scenarios from \texttt{ns-3/scratch/}. Without staging, there is a risk of \emph{version confusion}: a developer edits the scenario in \texttt{scenarios/}, but an outdated version in \texttt{scratch} is executed. By explicitly copying the scenario into \texttt{scratch} before building or running, the runner guarantees that the executed program corresponds exactly to the intended version.
+
+\section{Build Management}
+
+Building ns-3 is time-consuming; therefore, runner scripts typically build ns-3 once at the beginning of the pipeline, for example using:
+\begin{lstlisting}[language=bash]
+./ns3 build --jobs=N
+\end{lstlisting}
+
+The build output is stored in \texttt{results/pX/logs/build.log}. If the build fails, it is common practice to display only the final portion of the log on the terminal, preserving readability while ensuring auditability.
+
+\section{Deterministic Experimental Sweeps}
+
+During execution, the runner constructs an \emph{experimental matrix}: the set of parameter combinations defining the sweep (e.g., MODE $\times$ BE\_RATES or NSTAS $\times$ transmission type). Each run corresponds to exactly one point in the parameter space, and these points are enumerated deterministically with a well-defined order.
+
+Parameters are commonly provided via environment variables (e.g., \texttt{NSTAS="2,5,10"} or \texttt{BE\_RATES="0 10 20 40 60"}), converted into arrays, and expanded using nested loops. This approach avoids hardcoding and allows both small test sweeps and full sweeps without modifying the script.
+
+\section{Controlled Parallelization}
+
+Parallelization improves throughput for large experimental matrices but must be controlled. Scripts typically define a concurrency limit such as \texttt{JOBS=6}. Up to this limit, runs are launched in the background; when the limit is reached, the script waits for at least one run to complete before scheduling another. This strategy prevents system overload while maintaining manageable execution time.
+
+\section{Progress Counters and Tags}
+
+Progress counters (e.g., \texttt{[3/10]}) improve observability and facilitate debugging, especially in long sweeps. Even when runs complete out of order, counters printed at the start and end of each run provide a stable reference.
+
+Tags further enhance traceability. A tag encodes key parameters and forms the run directory and log names. For example, \texttt{p8\_ON\_be40\_s1\_r3} uniquely identifies a configuration with mode ON, BE rate 40, seed 1, and run 3.
+
+\section{Merging Outputs}
+
+While per-run isolation ensures correctness, analysis typically requires aggregated data. The runner therefore includes a merge stage that collects relevant files from \texttt{tmp\_runs/} and produces final datasets under \texttt{results/pX/raw/}. For CSV files, headers must be handled carefully: the header is written once, and only data rows from each run are appended to avoid corruption.
+
+\section{Cleanup and Reproducibility}
+
+Initial cleanup is critical for result validity. Residual directories in \texttt{tmp\_runs/} or leftover merged files can contaminate new results. Runner scripts therefore commonly provide options such as \texttt{CLEAN=true/false} and \texttt{KEEP\_TMP=true/false} to support both clean final runs and debug executions that preserve intermediate artifacts.
+
+\section{Defensive Bash Practices}
+
+Runner scripts should be implemented defensively. Enabling strict modes such as:
+\begin{lstlisting}[language=bash]
+set -euo pipefail
+\end{lstlisting}
+prevents silent failures by terminating execution on undefined variables or command errors. Logging standard output and error streams for each run is essential for traceability, and prerequisite checks improve robustness across environments.
+
+\section{Conclusion}
+
+This scripting pattern provides a compact yet scientifically rigorous framework for ns-3 experiments. By combining executable version control through staging, auditable builds, deterministic experimental matrices, controlled parallelization with isolated outputs, robust traceability mechanisms, and disciplined result merging, the runner script effectively serves as the \emph{Methods} section of an experimental study, defining precisely how simulations are executed and how data are transformed into defensible and analyzable results.
+
+\end{document}
