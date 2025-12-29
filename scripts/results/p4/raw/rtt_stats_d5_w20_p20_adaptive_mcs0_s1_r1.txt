@@ -1,3 +1,0 @@
-samples=1
-mean_ms=0
-p95_ms=0

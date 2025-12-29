@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # scripts/run_p8.sh
-#  Part 8 runner (parallel-safe with per-run outDir + merge)
-# Shows run progress like: [1/6]
+# Part 8 runner — P7-like CLI output + plots (logic preserved)
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# -------------------- configuration --------------------
+# ---------------------------- Paths ----------------------------
 NS3_DIR="${NS3_DIR:-$HOME/ns-3}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +15,6 @@ SCEN_NAME="${SCEN_NAME:-p8_qos_wmm}"
 SCEN_SRC="${SCEN_SRC:-$ROOT_DIR/scenarios/${SCEN_NAME}.cc}"
 SCENARIO="${SCENARIO:-scratch/${SCEN_NAME}}"
 
-# مهم: پوشه خروجی باید p8 باشد
 OUTDIR="${OUTDIR:-$ROOT_DIR/results/p8}"
 RAW_DIR="$OUTDIR/raw"
 LOG_DIR="$OUTDIR/logs"
@@ -26,15 +24,20 @@ TMP_ROOT="$OUTDIR/tmp_runs"
 CSV_OUT="$RAW_DIR/p8_summary.csv"
 CSV_HEADER="mode,beRateMbps,seed,run,goodputBE,goodputVO,goodputVI,delayVO_ms,jitterVO_ms,lossVO,delayVI_ms,jitterVI_ms,lossVI"
 
+# Python venv 
+VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
+PY="$VENV_DIR/bin/python"
+
+# ---------------------------- Switches/knobs ----------------------------
 CLEAN="${CLEAN:-true}"
 KEEP_TMP="${KEEP_TMP:-false}"
 
-# ---- build/parallel knobs ----
+# build / parallel
 BUILD_JOBS="${BUILD_JOBS:-2}"
 TAIL_LINES="${TAIL_LINES:-120}"
 
-JOBS="${JOBS:-6}"
 MAX_JOBS="${MAX_JOBS:-6}"
+JOBS="${JOBS:-${JOBS:-}}"
 
 LAUNCH_STAGGER_MS="${LAUNCH_STAGGER_MS:-250}"
 
@@ -43,7 +46,9 @@ IONICE_CLASS="${IONICE_CLASS:-2}"
 IONICE_LEVEL="${IONICE_LEVEL:-7}"
 CPULIMIT_PCT="${CPULIMIT_PCT:-10}"
 
-# -------------------- sweep parameters --------------------
+STRICT_PNG="${STRICT_PNG:-true}"
+
+# ---------------------------- Sweep params ----------------------------
 BE_RATES_STR="${BE_RATES:-0 10 20 40 60}"
 MODES_STR="${MODES:-OFF ON}"
 
@@ -74,23 +79,27 @@ BE_PKT="${BE_PKT_SIZE:-1200}"
 
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-# -------------------- helpers --------------------
-ts()   { date +"%Y-%m-%d %H:%M:%S"; }
-log()  { echo "[$(ts)] $*"; }
-warn() { echo "[$(ts)] WARN: $*" >&2; }
-die()  { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
+# ---------------------------- Helpers (P7-like) ----------------------------
+ts(){ date +"%Y-%m-%d %H:%M:%S"; }
+log(){ echo "[$(ts)] $*"; }
+warn(){ echo "[$(ts)] WARN: $*" >&2; }
+die(){ echo "[$(ts)] ERROR: $*" >&2; exit 1; }
 
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
+step_log(){ # step_log <i> <n> <verb> <what> [extra]
+  log "[P8] [$1/$2] $3 $4 ${5:-}"
+}
 
-ensure_dirs() { mkdir -p "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT"; }
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
-clean_outputs() {
+ensure_dirs(){ mkdir -p "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT"; }
+
+clean_outputs(){
   log "[P8] Cleaning outputs under: $OUTDIR"
   rm -rf "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT" || true
   ensure_dirs
 }
 
-stage_scenario() {
+stage_scenario(){
   [[ -d "$NS3_DIR" ]] || die "NS3_DIR not found: $NS3_DIR"
   [[ -f "$SCEN_SRC" ]] || die "Scenario source not found: $SCEN_SRC"
   mkdir -p "$NS3_DIR/scratch"
@@ -98,7 +107,7 @@ stage_scenario() {
   log "[P8] Staged scenario: $SCEN_SRC -> $NS3_DIR/scratch/${SCEN_NAME}.cc"
 }
 
-build_ns3_low_heat() {
+build_ns3_low_heat(){
   log "[P8] Building ns-3 (low-heat): -j${BUILD_JOBS}"
   local build_log="$LOG_DIR/build.log"
   ( cd "$NS3_DIR" && NINJAFLAGS="-j${BUILD_JOBS}" ./ns3 build ) >"$build_log" 2>&1 || {
@@ -109,24 +118,13 @@ build_ns3_low_heat() {
   log "[P8] Build OK"
 }
 
-to_array() {
-  local s="$1"
-  local -n out="$2"
-  local IFS=' '
-  read -r -a out <<< "$s"
-}
+to_array(){ local s="$1"; local -n out="$2"; local IFS=' '; read -r -a out <<< "$s"; }
 
-run_cmd_wrapped() {
+run_cmd_wrapped(){
   local run_log="$1"; shift
   local -a cmd=( "$@" )
-
-  if have_cmd ionice; then
-    cmd=( ionice -c "$IONICE_CLASS" -n "$IONICE_LEVEL" "${cmd[@]}" )
-  fi
-  if have_cmd nice; then
-    cmd=( nice -n "$NICE_LEVEL" "${cmd[@]}" )
-  fi
-
+  if have_cmd ionice; then cmd=( ionice -c "$IONICE_CLASS" -n "$IONICE_LEVEL" "${cmd[@]}" ); fi
+  if have_cmd nice;   then cmd=( nice -n "$NICE_LEVEL" "${cmd[@]}" ); fi
   if have_cmd cpulimit; then
     cpulimit -l "$CPULIMIT_PCT" -- "${cmd[@]}" >"$run_log" 2>&1
   else
@@ -134,23 +132,14 @@ run_cmd_wrapped() {
   fi
 }
 
-wait_for_slot() {
-  while (( $(jobs -rp | wc -l) >= JOBS )); do
-    wait -n || true
-  done
-}
+wait_for_slot(){ while (( $(jobs -rp | wc -l) >= JOBS )); do wait -n || true; done; }
 
-safe_tag() {
-  local mode="$1" be="$2" run="$3"
-  echo "p8_${mode}_be${be}_s${SEED}_r${run}"
-}
+safe_tag(){ local mode="$1" be="$2" run="$3"; echo "p8_${mode}_be${be}_s${SEED}_r${run}"; }
 
-init_master_csv() {
-  mkdir -p "$(dirname "$CSV_OUT")"
-  echo "$CSV_HEADER" > "$CSV_OUT"
-}
+init_master_csv(){ mkdir -p "$(dirname "$CSV_OUT")"; echo "$CSV_HEADER" > "$CSV_OUT"; }
 
-merge_summary_csv() {
+merge_summary_csv(){ 
+  step_log 1 2 MERGE start p8_summary.csv
   init_master_csv
   local f first
   while IFS= read -r f; do
@@ -162,14 +151,14 @@ merge_summary_csv() {
       cat "$f" >> "$CSV_OUT" || true
     fi
   done < <(find "$TMP_ROOT" -type f -path "*/raw/p8_summary.csv" | sort)
-  log "[P8] Merge -> $CSV_OUT"
+  step_log 1 2 MERGE ok    p8_summary.csv
 }
 
-run_one() {
+run_one(){
   local tag="$1" args="$2" out_run="$3" seq="$4" total="$5"
   local run_log="$LOG_DIR/${tag}.log"
 
-  log "[P8] [${seq}/${total}] RUN start  ${tag}"
+  log "[P8] [$seq/$total] RUN start $tag"
 
   mkdir -p "$out_run/raw" "$out_run/logs" "$out_run/plots" "$out_run/pcap"
   echo "$CSV_HEADER" > "$out_run/raw/p8_summary.csv"
@@ -182,27 +171,61 @@ run_one() {
 
   local rc=$?
   if (( rc != 0 )); then
-    warn "[P8] [${seq}/${total}] RUN FAILED: $tag (rc=$rc)"
+    warn "[P8] [$seq/$total] RUN FAILED: $tag (rc=$rc)"
     warn "[P8] Log file: $run_log"
     tail -n "$TAIL_LINES" "$run_log" || true
     return "$rc"
   fi
 
-  log "[P8] [${seq}/${total}] RUN ok     ${tag}"
+  log "[P8] [$seq/$total] RUN ok    $tag"
   return 0
 }
 
-# -------------------- main --------------------
-main() {
-  if (( JOBS > MAX_JOBS )); then JOBS="$MAX_JOBS"; fi
-  if (( JOBS < 1 )); then JOBS=1; fi
-  if (( BUILD_JOBS < 1 )); then BUILD_JOBS=1; fi
+copy_per_run_tree(){ 
+  mkdir -p "$RAW_DIR/per_run_raw"
+  if have_cmd rsync; then
+    rsync -a --delete "$TMP_ROOT/" "$RAW_DIR/per_run_raw/" >/dev/null 2>&1 || true
+  else
+    rm -rf "$RAW_DIR/per_run_raw" || true
+    mkdir -p "$RAW_DIR/per_run_raw"
+    cp -a "$TMP_ROOT/." "$RAW_DIR/per_run_raw/" 2>/dev/null || true
+  fi
+}
+
+# ---------------------------- Plot glue ----------------------------
+ensure_venv(){ [[ -x "$PY" ]] || python3 -m venv "$VENV_DIR"; }
+check_plot_deps_or_die(){
+  "$PY" - <<'PY'
+import importlib, sys
+for p in ["numpy","pandas","plotly","kaleido"]:
+    try: importlib.import_module(p)
+    except Exception:
+        sys.exit(2)
+PY
+}
+run_plots(){
+  log "[P8] [PLOT] start p8_plots"
+  local args=()
+  [[ "${STRICT_PNG,,}" == "true" ]] && args+=(--strict-png)
+  "$PY" "$ROOT_DIR/scripts/plot_p8.py" --results "$OUTDIR" "${args[@]}" \
+    >"$LOG_DIR/plots.log" 2>&1 || {
+      warn "[P8] [PLOT] failed (see $LOG_DIR/plots.log)"
+      return 1
+    }
+  log "[P8] [PLOT] ok    p8_plots"
+}
+
+# ---------------------------- Main ----------------------------
+main(){
+  if [[ -z "${JOBS:-}" || "$JOBS" == "" ]]; then
+    JOBS=$(nproc 2>/dev/null | awk '{print int($1/2)}')
+  fi
+  (( JOBS < 1 )) && JOBS=1
+  (( JOBS > MAX_JOBS )) && JOBS="$MAX_JOBS"
+  (( BUILD_JOBS < 1 )) && BUILD_JOBS=1
 
   ensure_dirs
-  if [[ "$CLEAN" == "true" ]]; then
-    clean_outputs
-  fi
-  mkdir -p "$TMP_ROOT"
+  [[ "$CLEAN" == "true" ]] && clean_outputs
 
   stage_scenario
   build_ns3_low_heat
@@ -223,7 +246,7 @@ main() {
   (( total > 0 )) || die "[P8] No runs to execute."
   log "[P8] Runs: total=${total}, max parallel JOBS=${JOBS}"
 
-  local idx=0 run_num tag out_run args item
+  local idx=0 run_num tag out_run args item running=0 fail=0
   for item in "${jobs_list[@]}"; do
     IFS='|' read -r mode be <<< "$item"
     idx=$((idx + 1))
@@ -233,7 +256,7 @@ main() {
     out_run="$TMP_ROOT/$tag"
     mkdir -p "$out_run"
 
-    # IMPORTANT: outDir per run to avoid overwrite/races
+    # IMPORTANT: outDir per run to avoid overwrite/races 
     args="--mode=${mode} --beRateMbps=${be} --duration=${DURATION} --appStart=${APP_START}"
     args+=" --seed=${SEED} --run=${run_num} --outDir=${out_run}"
     args+=" --flowmon=${FLOWMON} --pcap=${PCAP} --verboseApp=${VERBOSE_APP}"
@@ -242,35 +265,30 @@ main() {
     args+=" --voPktSize=${VO_PKT} --voPps=${VO_PPS}"
     args+=" --viPktSize=${VI_PKT} --viRateMbps=${VI_RATE}"
     args+=" --bePktSize=${BE_PKT}"
+    [[ -n "$EXTRA_ARGS" ]] && args+=" ${EXTRA_ARGS}"
 
-    if [[ -n "$EXTRA_ARGS" ]]; then
-      args+=" ${EXTRA_ARGS}"
-    fi
-
-    wait_for_slot
+    (( running >= JOBS )) && { wait -n || fail=$((fail+1)); running=$((running-1)); }
     ( run_one "$tag" "$args" "$out_run" "$idx" "$total" ) &
+    running=$((running+1))
 
     if (( LAUNCH_STAGGER_MS > 0 )); then
       python3 - <<PY >/dev/null 2>&1 || true
-import time
-time.sleep(${LAUNCH_STAGGER_MS}/1000.0)
+import time; time.sleep(${LAUNCH_STAGGER_MS}/1000.0)
 PY
     fi
   done
 
-  wait || true
+  while (( running > 0 )); do
+    wait -n || fail=$((fail+1))
+    running=$((running-1))
+  done
 
+  # MERGE (P7-like logs)
   merge_summary_csv
 
-  # Copy per-run artifacts for inspection
-  mkdir -p "$RAW_DIR/per_run_raw"
-  if have_cmd rsync; then
-    rsync -a --delete "$TMP_ROOT/" "$RAW_DIR/per_run_raw/" >/dev/null 2>&1 || true
-  else
-    rm -rf "$RAW_DIR/per_run_raw" || true
-    mkdir -p "$RAW_DIR/per_run_raw"
-    cp -a "$TMP_ROOT/." "$RAW_DIR/per_run_raw/" 2>/dev/null || true
-  fi
+  step_log 2 2 MERGE start per_run_artifacts
+  copy_per_run_tree
+  step_log 2 2 MERGE ok    per_run_artifacts
 
   if [[ "$KEEP_TMP" != "true" ]]; then
     rm -rf "$TMP_ROOT" || true
@@ -278,25 +296,15 @@ PY
     log "[P8] KEEP_TMP=true (tmp runs kept at: $TMP_ROOT)"
   fi
 
-  cat <<EOF
+  # ---- Plots ----
+  ensure_venv
+  check_plot_deps_or_die
+  if ! "$PY" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+    warn "[P8] Python in venv not usable"
+  fi
+  run_plots
 
-====================== [P8] Summary ======================
-NS3_DIR : $NS3_DIR
-Scenario: $SCENARIO
-Source  : $SCEN_SRC
-OutDir  : $OUTDIR
-Raw     : $RAW_DIR
-Logs    : $LOG_DIR
-Plots   : $PLOT_DIR
-----------------------------------------------------------
-Key outputs:
-  - $CSV_OUT
-  - per-run artifacts under $RAW_DIR/per_run_raw/
-==========================================================
-
-EOF
-
-  log "[P8] Done."
+  (( fail == 0 )) || die "[P8] One or more runs failed"
 }
 
 main "$@"

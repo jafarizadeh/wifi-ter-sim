@@ -1,197 +1,282 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
 import sys
-import re
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-RESULTS_DIR = os.path.join(REPO_ROOT, "results", "p4")
-CSV_FILE = os.path.join(RESULTS_DIR, "p4_matrix_global.csv")
-PLOTS_DIR = os.path.join(RESULTS_DIR, "plots")
-
-sns.set_style("whitegrid")
-sns.set_context("paper", font_scale=1.4)
-plt.rcParams.update({"figure.autolayout": True})
+import plotly.graph_objects as go
 
 
-def parse_mbps(rate_str: str) -> float:
-    """Parses strings like '50Mbps' into float Mbps."""
-    if pd.isna(rate_str):
-        return np.nan
-    s = str(rate_str).strip()
-    m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*Mbps\s*$", s, re.IGNORECASE)
-    if m:
-        return float(m.group(1))
-    return np.nan
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
-def main():
-    print("--- Starting Scientific Plotting ---")
-    os.makedirs(PLOTS_DIR, exist_ok=True)
+def resolve_results_dir(user_path: str | None, project: str = "p4") -> Path:
+    root = repo_root()
+    if user_path:
+        p = Path(user_path)
+        if p.exists():
+            return p.resolve()
+        p2 = (root / user_path).resolve()
+        if p2.exists():
+            return p2
+        raise FileNotFoundError(f"--results not found: {user_path}")
+    return (root / "results" / project).resolve()
 
-    if not os.path.exists(CSV_FILE):
-        print(f"[Error] Global CSV not found: {CSV_FILE}")
-        print("Did you run 'run_p4.sh' successfully to aggregate data?")
-        sys.exit(1)
 
-    df = pd.read_csv(CSV_FILE)
-    df.columns = df.columns.str.strip()
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
-    if df.empty:
-        print("[Error] CSV is empty.")
-        sys.exit(1)
 
-    # Basic required columns check (helpful error messages)
-    required = ["distance", "channelWidth", "txPowerDbm", "mcs", "rxBytes", "rateMode", "udpRate"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing required columns in CSV: {missing}\nAvailable columns: {list(df.columns)}")
+def save_fig_safe(fig: go.Figure, out_dir: Path, stem: str, strict_png: bool) -> None:
+    """
+    Always writes HTML. Writes PNG via kaleido if available.
+    If strict_png=True, failure to write PNG is fatal.
+    """
+    ensure_dir(out_dir)
+    html = out_dir / f"{stem}.html"
+    fig.write_html(str(html), include_plotlyjs="cdn")
 
-    # Ensure numeric types (only if present)
-    for col in ["distance", "channelWidth", "txPowerDbm", "mcs", "rxBytes"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    png = out_dir / f"{stem}.png"
+    try:
+        # do not pass engine=... to avoid future deprecation behavior changes
+        fig.write_image(str(png), scale=2)
+    except Exception as e:
+        if strict_png:
+            raise RuntimeError(f"PNG export failed for '{stem}': {e}") from e
+        # non-strict: ignore PNG errors (HTML still produced)
 
-    # RTT column compatibility
-    if "rtt_mean_ms" in df.columns:
-        df["rtt_mean_ms"] = pd.to_numeric(df["rtt_mean_ms"], errors="coerce")
-    elif "rttMeanMs" in df.columns:
-        df["rtt_mean_ms"] = pd.to_numeric(df["rttMeanMs"], errors="coerce")
-    else:
-        df["rtt_mean_ms"] = np.nan
 
-    # Drop failed runs (no received bytes)
-    df = df[df["rxBytes"].fillna(0) > 0].copy()
+def mean_ci95(x: pd.Series) -> tuple[float, float, float, int]:
+    x = pd.to_numeric(x, errors="coerce").dropna().astype(float)
+    n = int(len(x))
+    if n == 0:
+        return np.nan, np.nan, np.nan, 0
+    m = float(x.mean())
+    if n == 1:
+        return m, m, m, 1
+    s = float(x.std(ddof=1))
+    se = s / np.sqrt(n)
+    lo = m - 1.96 * se
+    hi = m + 1.96 * se
+    return m, lo, hi, n
 
-    # -------------------- Goodput column compatibility --------------------
-    # Supports any of: goodput_Mbps, goodputMbps, goodputbps, goodput_mbps
-    if "goodput_mbps" in df.columns:
-        df["goodput_mbps"] = pd.to_numeric(df["goodput_mbps"], errors="coerce")
-    elif "goodput_Mbps" in df.columns:
-        df["goodput_mbps"] = pd.to_numeric(df["goodput_Mbps"], errors="coerce")
-    elif "goodputMbps" in df.columns:
-        df["goodput_mbps"] = pd.to_numeric(df["goodputMbps"], errors="coerce")
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Goodput -> goodputMbps
+    if "goodputMbps" in df.columns:
+        df["goodputMbps"] = pd.to_numeric(df["goodputMbps"], errors="coerce")
     elif "goodputbps" in df.columns:
-        df["goodput_mbps"] = pd.to_numeric(df["goodputbps"], errors="coerce") / 1e6
+        df["goodputMbps"] = pd.to_numeric(df["goodputbps"], errors="coerce") / 1e6
+    elif "goodput_Mbps" in df.columns:
+        df["goodputMbps"] = pd.to_numeric(df["goodput_Mbps"], errors="coerce")
     else:
-        raise KeyError(f"No goodput column found. Columns are: {list(df.columns)}")
+        raise ValueError("No goodput column found (expected one of: goodputMbps, goodputbps, goodput_Mbps)")
 
-    # Safety net: if someone stored bps but labeled as Mbps, convert values that are clearly too big
-    # (in your scenarios Mbps won't be > 1000)
-    mask = df["goodput_mbps"] > 1000
-    df.loc[mask, "goodput_mbps"] = df.loc[mask, "goodput_mbps"] / 1e6
+    # RTT mean -> rttMeanMs (best-effort)
+    if "rttMeanMs" in df.columns:
+        df["rttMeanMs"] = pd.to_numeric(df["rttMeanMs"], errors="coerce")
+    elif "rtt_mean_ms" in df.columns:
+        df["rttMeanMs"] = pd.to_numeric(df["rtt_mean_ms"], errors="coerce")
+    else:
+        df["rttMeanMs"] = np.nan
 
-    # Clean RTT invalid values
-    df.loc[df["rtt_mean_ms"] < 0, "rtt_mean_ms"] = np.nan
+    # distance column -> distance
+    if "distance" not in df.columns and "distance_m" in df.columns:
+        df["distance"] = df["distance_m"]
 
-    # Labels
-    def make_label(row):
-        if str(row["rateMode"]).strip().lower() == "adaptive":
-            return "Adaptive (Minstrel)"
-        try:
-            return f"Fixed MCS {int(row['mcs'])}"
-        except Exception:
-            return "Fixed MCS"
+    # numeric coercions
+    for c in [
+        "distance", "distance_m", "channelWidth", "txPowerDbm", "mcs",
+        "run", "seed", "rxBytes", "rttMeanMs", "goodputMbps"
+    ]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["Label"] = df.apply(make_label, axis=1)
+    # rate mode label
+    def mode_label(r: pd.Series) -> str:
+        rm = str(r.get("rateMode", "")).strip().lower()
+        if rm == "adaptive":
+            return "adaptive"
+        if rm == "constant":
+            try:
+                return f"constant MCS{int(r.get('mcs', 0))}"
+            except Exception:
+                return "constant"
+        return rm if rm else "unknown"
 
-    # Offered load for y-limits
-    df["udp_mbps"] = df["udpRate"].apply(parse_mbps)
-    offered = float(df["udp_mbps"].dropna().iloc[0]) if df["udp_mbps"].notna().any() else None
+    df["modeLabel"] = df.apply(mode_label, axis=1)
+    return df
 
-    # -------------------------------------------------------------------------
-    # Plot 1: Bandwidth Scaling
-    # -------------------------------------------------------------------------
-    print("Generating Plot 1: Bandwidth Scaling...")
-    subset_fig1 = df[df["txPowerDbm"] == 20]
 
-    if not subset_fig1.empty:
-        g = sns.catplot(
-            data=subset_fig1,
+def line_ci_figure(agg: pd.DataFrame, x: str, title: str, y_title: str, series_col: str) -> go.Figure:
+    fig = go.Figure()
+
+    for name, g in agg.groupby(series_col):
+        g = g.sort_values(x)
+        xs = g[x].to_numpy()
+        ys = g["mean"].to_numpy()
+        lo = g["ci_lo"].to_numpy()
+        hi = g["ci_hi"].to_numpy()
+
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([xs, xs[::-1]]),
+            y=np.concatenate([hi, lo[::-1]]),
+            fill="toself",
+            line=dict(width=0),
+            hoverinfo="skip",
+            showlegend=False,
+            opacity=0.18,
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=xs,
+            y=ys,
+            mode="lines+markers",
+            name=str(name),
+            hovertemplate=f"{x}=%{{x}}<br>{y_title}=%{{y:.3f}}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title=x,
+        yaxis_title=y_title,
+        template="plotly_white",
+        hovermode="x unified",
+        legend_title=series_col,
+    )
+    return fig
+
+
+def heatmap_goodput(df: pd.DataFrame, distance: float, mode: str) -> go.Figure:
+    g = df[(df["distance"] == distance) & (df["modeLabel"] == mode)].copy()
+    if g.empty:
+        raise ValueError("No data for heatmap selection")
+
+    pivot = g.groupby(["txPowerDbm", "channelWidth"])["goodputMbps"].mean().reset_index()
+    z = pivot.pivot(index="txPowerDbm", columns="channelWidth", values="goodputMbps").sort_index()
+
+    fig = go.Figure(data=go.Heatmap(
+        x=z.columns.astype(float),
+        y=z.index.astype(float),
+        z=z.values,
+        hovertemplate="width=%{x} MHz<br>power=%{y} dBm<br>goodput=%{z:.3f} Mbps<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"P4 - Heatmap Goodput (distance={distance} m, mode={mode})",
+        xaxis_title="Channel width (MHz)",
+        yaxis_title="Tx power (dBm)",
+        template="plotly_white",
+    )
+    return fig
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Plot Project 4 (PHY/MAC sweep) results.")
+    ap.add_argument("--results", type=str, default=None, help="Path to results/p4 (default: <repo>/results/p4)")
+    ap.add_argument("--strict-png", action="store_true", help="Fail if PNG export fails (requires kaleido).")
+    args = ap.parse_args()
+
+    res_dir = resolve_results_dir(args.results, "p4")
+    raw_dir = res_dir / "raw"
+    plot_dir = res_dir / "plots"
+    ensure_dir(plot_dir)
+
+    csv_path = raw_dir / "p4_matrix.csv"
+    if not csv_path.exists():
+        print(f"[ERROR] Missing: {csv_path}", file=sys.stderr)
+        print("Run: ./scripts/run_p4.sh", file=sys.stderr)
+        return 2
+
+    df = pd.read_csv(csv_path)
+    df = normalize_columns(df)
+
+    # Pick-or-closest helper (robust if grid differs)
+    def pick_or_closest(col: str, target: float) -> float:
+        vals = sorted(v for v in df[col].dropna().unique().tolist())
+        if not vals:
+            return target
+        return min(vals, key=lambda v: abs(v - target))
+
+    power20 = pick_or_closest("txPowerDbm", 20.0)
+    d5 = pick_or_closest("distance", 5.0)
+    d20 = pick_or_closest("distance", 20.0)
+    w80 = pick_or_closest("channelWidth", 80.0)
+
+    # --- Fig 1: Goodput vs width (distance 5 & 20, power 20) ---
+    def fig_goodput_vs_width(distance: float, power: float) -> go.Figure:
+        sub = df[(df["distance"] == distance) & (df["txPowerDbm"] == power)].copy()
+        if sub.empty:
+            raise ValueError("No data for required selection (goodput vs width)")
+        rows = []
+        for (mode, w), g in sub.groupby(["modeLabel", "channelWidth"]):
+            m, lo, hi, n = mean_ci95(g["goodputMbps"])
+            rows.append({"modeLabel": mode, "channelWidth": w, "mean": m, "ci_lo": lo, "ci_hi": hi, "n": n})
+        agg = pd.DataFrame(rows)
+        return line_ci_figure(
+            agg,
             x="channelWidth",
-            y="goodput_mbps",
-            hue="Label",
-            col="distance",
-            kind="bar",
-            height=5,
-            aspect=1.2,
-            palette="viridis",
-            edgecolor="black",
-            errorbar=None,
+            title=f"P4 - Goodput vs Channel width (distance={distance} m, power={power} dBm)",
+            y_title="Goodput (Mbps)",
+            series_col="modeLabel",
         )
-        g.fig.subplots_adjust(top=0.85)
-        g.fig.suptitle("Impact of Channel Width on Capacity (TxPower=20dBm)", fontweight="bold")
-        g.set_axis_labels("Channel Width (MHz)", "Goodput (Mbps)")
-        g.set_titles("Distance: {col_name} m")
 
-        out_f1 = os.path.join(PLOTS_DIR, "fig1_bandwidth_scaling.png")
-        plt.savefig(out_f1, dpi=300)
-        print(f" -> Saved: {out_f1}")
-        plt.close()
+    save_fig_safe(fig_goodput_vs_width(d5, power20), plot_dir, f"goodput_vs_width_d{int(d5)}_p{int(power20)}", args.strict_png)
+    save_fig_safe(fig_goodput_vs_width(d20, power20), plot_dir, f"goodput_vs_width_d{int(d20)}_p{int(power20)}", args.strict_png)
 
-    # -------------------------------------------------------------------------
-    # Plot 2: Power Sensitivity at Edge
-    # -------------------------------------------------------------------------
-    print("Generating Plot 2: Power Sensitivity at Cell Edge...")
-    subset_fig2 = df[(df["channelWidth"] == 80) & (df["distance"] == 20)]
-
-    if not subset_fig2.empty:
-        plt.figure(figsize=(9, 6))
-        sns.barplot(
-            data=subset_fig2,
+    # --- Fig 2: Goodput vs power (distance 20, width 80) ---
+    sub2 = df[(df["distance"] == d20) & (df["channelWidth"] == w80)].copy()
+    if not sub2.empty:
+        rows = []
+        for (mode, p), g in sub2.groupby(["modeLabel", "txPowerDbm"]):
+            m, lo, hi, n = mean_ci95(g["goodputMbps"])
+            rows.append({"modeLabel": mode, "txPowerDbm": p, "mean": m, "ci_lo": lo, "ci_hi": hi, "n": n})
+        agg2 = pd.DataFrame(rows)
+        fig2 = line_ci_figure(
+            agg2,
             x="txPowerDbm",
-            y="goodput_mbps",
-            hue="Label",
-            palette="magma",
-            edgecolor="black",
+            title=f"P4 - Goodput vs Tx power (distance={d20} m, width={w80} MHz)",
+            y_title="Goodput (Mbps)",
+            series_col="modeLabel",
         )
-        plt.title("Power Sensitivity at Cell Edge (Dist=20m, BW=80MHz)", fontweight="bold")
-        plt.xlabel("Transmission Power (dBm)")
-        plt.ylabel("Goodput (Mbps)")
-        if offered is not None:
-            plt.ylim(0, offered * 1.05)
-        plt.legend(title="Rate Control Strategy")
+        save_fig_safe(fig2, plot_dir, f"goodput_vs_power_d{int(d20)}_w{int(w80)}", args.strict_png)
 
-        out_f2 = os.path.join(PLOTS_DIR, "fig2_power_sensitivity.png")
-        plt.savefig(out_f2, dpi=300)
-        print(f" -> Saved: {out_f2}")
-        plt.close()
-
-    # -------------------------------------------------------------------------
-    # Plot 3: RTT vs Width
-    # -------------------------------------------------------------------------
-    print("Generating Plot 3: Latency & Jitter Analysis...")
-    subset_fig3 = df[(df["distance"] == 20) & (df["rtt_mean_ms"].notna())]
-
-    if not subset_fig3.empty:
-        plt.figure(figsize=(10, 6))
-        sns.pointplot(
-            data=subset_fig3,
+    # --- Fig 3: RTT vs width (distance 20, power 20) ---
+    sub3 = df[(df["distance"] == d20) & (df["txPowerDbm"] == power20)].copy()
+    if (not sub3.empty) and sub3["rttMeanMs"].notna().any():
+        rows = []
+        for (mode, w), g in sub3.groupby(["modeLabel", "channelWidth"]):
+            m, lo, hi, n = mean_ci95(g["rttMeanMs"])
+            rows.append({"modeLabel": mode, "channelWidth": w, "mean": m, "ci_lo": lo, "ci_hi": hi, "n": n})
+        agg3 = pd.DataFrame(rows)
+        fig3 = line_ci_figure(
+            agg3,
             x="channelWidth",
-            y="rtt_mean_ms",
-            hue="Label",
-            markers=["o", "s", "^"],
-            linestyles=["-", "--", "-."],
-            scale=1.2,
+            title=f"P4 - RTT vs Channel width (distance={d20} m, power={power20} dBm)",
+            y_title="RTT mean (ms)",
+            series_col="modeLabel",
         )
-        plt.title("Latency penalty of wider channels at Edge (20m)", fontweight="bold")
-        plt.xlabel("Channel Width (MHz)")
-        plt.ylabel("Mean RTT (ms)")
-        plt.grid(True, linestyle="--", alpha=0.7)
-        plt.legend(title="Configuration")
+        save_fig_safe(fig3, plot_dir, f"rtt_vs_width_d{int(d20)}_p{int(power20)}", args.strict_png)
+        save_fig_safe(fig3, plot_dir, "rtt_comparison", args.strict_png)
 
-        out_f3 = os.path.join(PLOTS_DIR, "fig3_latency_analysis.png")
-        plt.savefig(out_f3, dpi=300)
-        print(f" -> Saved: {out_f3}")
-        plt.close()
+    # --- Optional heatmaps ---
+    try:
+        for dist in [d5, d20]:
+            for mode in ["adaptive", "constant MCS0", "constant MCS7"]:
+                if df[(df["distance"] == dist) & (df["modeLabel"] == mode)].shape[0] >= 4:
+                    fig_hm = heatmap_goodput(df, dist, mode)
+                    save_fig_safe(fig_hm, plot_dir, f"heatmap_goodput_d{int(dist)}_{mode.replace(' ','_')}", args.strict_png)
+    except Exception:
+        pass
 
-    print(f"--- Done. Scientific plots saved to {PLOTS_DIR} ---")
+    print("[OK] P4 plots saved to:", plot_dir)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

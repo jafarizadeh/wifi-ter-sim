@@ -1,431 +1,355 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Project 7 (ns-3) Plotter: co-channel (cocanal) vs separate-channel (separe)
-
-Reads:
-  - results/p7/raw/p7_summary.csv
-  - results/p7/raw/perflow_*.csv   (optional but recommended)
-
-Writes PNGs to:
-  - results/p7/plots/
-
-Produces:
-  1) goodput_total_vs_n.png
-  2) goodput_cells_vs_n.png
-  3) jain_vs_n.png
-  4) per_sta_bars_n10.png
-  5) per_sta_box_n10.png
-  6) per_sta_cdf_n10.png
-  7) per_sta_ecdf_by_cell_n10.png
-  8) per_sta_box_by_cell_n10.png
-
-Usage:
-  python3 scripts/plot_p7.py
-"""
 
 from __future__ import annotations
 
-import re
-import glob
+import argparse
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+import re
+import sys
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 
-# -------------------------- Paths --------------------------
-ROOT = Path(__file__).resolve().parents[1]   # repo root: wifi-ter-sim/
-RAW_DIR = ROOT / "results" / "p7" / "raw"
-PLOTS_DIR = ROOT / "results" / "p7" / "plots"
-
-SUMMARY_CSV = RAW_DIR / "p7_summary.csv"
-PERFLOW_GLOB = str(RAW_DIR / "perflow_*.csv")
+# -------------------- Paths --------------------
+def repo_root() -> Path:
+    # WIFI-TER-SIM/scripts/plot_p7.py -> parents[1] == repo root
+    return Path(__file__).resolve().parents[1]
 
 
-# -------------------------- Utils --------------------------
-def ensure_dirs() -> None:
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+def resolve_results_dir(user_path: str | None, project: str = "p7") -> Path:
+    root = repo_root()
+    if user_path:
+        p = Path(user_path)
+        if p.exists():
+            return p.resolve()
+        p2 = (root / user_path).resolve()
+        if p2.exists():
+            return p2
+        raise FileNotFoundError(f"--results not found: {user_path}")
+    return (root / "results" / project).resolve()
 
 
-def mbps(x_bps: np.ndarray | pd.Series | float) -> np.ndarray:
-    return np.asarray(x_bps, dtype=float) / 1e6
+def ensure_dir(d: Path) -> None:
+    d.mkdir(parents=True, exist_ok=True)
 
 
-def normalize_plan(s: str) -> str:
-    s = str(s).strip().lower()
-    mapping = {
-        "co": "cocanal",
-        "cocanal": "cocanal",
-        "cochannel": "cocanal",
-        "co-channel": "cocanal",
-        "sep": "separe",
-        "separe": "separe",
-        "separate": "separe",
-        "separatechannel": "separe",
-        "separate-channel": "separe",
-    }
-    return mapping.get(s, s)
+# -------------------- Safe save --------------------
+def save_fig_safe(fig: go.Figure, out_dir: Path, stem: str, strict_png: bool) -> None:
+    """
+    Always writes HTML. Writes PNG via kaleido if available.
+    If strict_png=True then PNG failure is fatal.
+    """
+    ensure_dir(out_dir)
+
+    html = out_dir / f"{stem}.html"
+    fig.write_html(str(html), include_plotlyjs="cdn")
+
+    png = out_dir / f"{stem}.png"
+    try:
+        fig.write_image(str(png), scale=2)
+    except Exception as e:
+        if strict_png:
+            raise RuntimeError(f"PNG export failed for '{stem}': {e}") from e
 
 
-def read_summary() -> pd.DataFrame:
-    if not SUMMARY_CSV.exists():
-        raise FileNotFoundError(f"Missing: {SUMMARY_CSV}")
-
-    df = pd.read_csv(SUMMARY_CSV)
-
-    required = [
-        "channelPlan", "nStaPerCell",
-        "goodputCell1", "goodputCell2", "goodputTotal",
-        "jainCells",
-    ]
-    missing = [c for c in required if c not in df.columns]
+# -------------------- Helpers --------------------
+def must_cols(df: pd.DataFrame, cols: list[str]) -> None:
+    missing = [c for c in cols if c not in df.columns]
     if missing:
-        raise ValueError(f"Summary CSV missing columns: {missing}\nFound: {list(df.columns)}")
-
-    df["channelPlan"] = df["channelPlan"].map(normalize_plan)
-
-    # numeric
-    for c in ["nStaPerCell", "goodputCell1", "goodputCell2", "goodputTotal", "jainCells"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=["channelPlan", "nStaPerCell"])
-    df["nStaPerCell"] = df["nStaPerCell"].astype(int)
-    return df
+        raise ValueError(f"Missing columns: {missing}. Available: {list(df.columns)}")
 
 
-# Parse perflow_<plan>_n<NUM>_run<RUN>.csv
-PERFLOW_RE = re.compile(r"^perflow_(?P<plan>[^_]+)_n(?P<n>\d+)_run(?P<run>\d+)\.csv$", re.IGNORECASE)
+def to_num(df: pd.DataFrame, cols: list[str]) -> None:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
 
-def read_perflow_latest() -> Dict[Tuple[str, int], pd.DataFrame]:
-    """
-    Returns: (plan, nStaPerCell) -> perflow DataFrame for the *latest run* found for that key.
-    Expects columns: cellId, staId, rxBytes, goodputbps
-    """
-    paths = sorted(glob.glob(PERFLOW_GLOB))
-    chosen: Dict[Tuple[str, int], Tuple[int, Path]] = {}
-
-    for p in paths:
-        name = Path(p).name
-        m = PERFLOW_RE.match(name)
-        if not m:
-            continue
-        plan = normalize_plan(m.group("plan"))
-        n = int(m.group("n"))
-        run = int(m.group("run"))
-        key = (plan, n)
-        if key not in chosen or run > chosen[key][0]:
-            chosen[key] = (run, Path(p))
-
-    out: Dict[Tuple[str, int], pd.DataFrame] = {}
-    for (plan, n), (run, path) in chosen.items():
-        df = pd.read_csv(path)
-        if "goodputbps" not in df.columns:
-            continue
-        df["goodputbps"] = pd.to_numeric(df["goodputbps"], errors="coerce")
-        df["cellId"] = pd.to_numeric(df.get("cellId", np.nan), errors="coerce")
-        df["staId"] = pd.to_numeric(df.get("staId", np.nan), errors="coerce")
-        df = df.dropna(subset=["goodputbps", "cellId", "staId"]).copy()
-        df["cellId"] = df["cellId"].astype(int)
-        df["staId"] = df["staId"].astype(int)
-        out[(plan, n)] = df
-
-    return out
+def mean_std(x: pd.Series) -> tuple[float, float, int]:
+    v = pd.to_numeric(x, errors="coerce").dropna().astype(float)
+    n = int(len(v))
+    if n == 0:
+        return np.nan, np.nan, 0
+    if n == 1:
+        return float(v.iloc[0]), 0.0, 1
+    return float(v.mean()), float(v.std(ddof=1)), n
 
 
-# -------------------------- Plots from summary --------------------------
-def plot_total_goodput(df: pd.DataFrame) -> None:
-    g = (
-        df.groupby(["channelPlan", "nStaPerCell"], as_index=False)
-        .agg(
-            goodputTotal_mean=("goodputTotal", "mean"),
-            goodputTotal_std=("goodputTotal", "std"),
-            runs=("goodputTotal", "count"),
-        )
-        .sort_values(["nStaPerCell", "channelPlan"])
-    )
-
-    plt.figure()
-    for plan in ["cocanal", "separe"]:
-        sub = g[g["channelPlan"] == plan].sort_values("nStaPerCell")
-        if sub.empty:
-            continue
-        x = sub["nStaPerCell"].to_numpy()
-        y = mbps(sub["goodputTotal_mean"])
-        yerr = mbps(sub["goodputTotal_std"].fillna(0.0))
-        plt.errorbar(x, y, yerr=yerr, marker="o", capsize=3, label=f"{plan} (mean±std)")
-
-    plt.xlabel("nStaPerCell")
-    plt.ylabel("Total Goodput (Mbps)")
-    plt.title("P7: Total Goodput vs nStaPerCell")
-    plt.grid(True, which="both")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / "goodput_total_vs_n.png", dpi=200)
-    plt.close()
+def bps_to_mbps(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    return s / 1e6
 
 
-def plot_cells_goodput(df: pd.DataFrame) -> None:
-    g = (
-        df.groupby(["channelPlan", "nStaPerCell"], as_index=False)
-        .agg(
-            cell1_mean=("goodputCell1", "mean"),
-            cell1_std=("goodputCell1", "std"),
-            cell2_mean=("goodputCell2", "mean"),
-            cell2_std=("goodputCell2", "std"),
-            runs=("goodputCell1", "count"),
-        )
-        .sort_values(["nStaPerCell", "channelPlan"])
-    )
-
-    plt.figure()
-    for plan in ["cocanal", "separe"]:
-        sub = g[g["channelPlan"] == plan].sort_values("nStaPerCell")
-        if sub.empty:
-            continue
-        x = sub["nStaPerCell"].to_numpy()
-
-        plt.errorbar(x, mbps(sub["cell1_mean"]), yerr=mbps(sub["cell1_std"].fillna(0.0)),
-                     marker="o", capsize=3, label=f"{plan} - cell1")
-        plt.errorbar(x, mbps(sub["cell2_mean"]), yerr=mbps(sub["cell2_std"].fillna(0.0)),
-                     marker="s", capsize=3, label=f"{plan} - cell2")
-
-    plt.xlabel("nStaPerCell")
-    plt.ylabel("Goodput (Mbps)")
-    plt.title("P7: Per-Cell Goodput vs nStaPerCell")
-    plt.grid(True, which="both")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / "goodput_cells_vs_n.png", dpi=200)
-    plt.close()
+def plan_pretty(p: str) -> str:
+    p = str(p).strip().lower()
+    if p in ("cocanal", "cochannel", "co-channel", "co_canal"):
+        return "co-canal"
+    if p in ("separe", "separee", "separé", "separe_", "separate"):
+        return "séparé"
+    return p
 
 
-def plot_jain(df: pd.DataFrame) -> None:
-    g = (
-        df.groupby(["channelPlan", "nStaPerCell"], as_index=False)
-        .agg(
-            jain_mean=("jainCells", "mean"),
-            jain_std=("jainCells", "std"),
-            runs=("jainCells", "count"),
-        )
-        .sort_values(["nStaPerCell", "channelPlan"])
-    )
-
-    plt.figure()
-    for plan in ["cocanal", "separe"]:
-        sub = g[g["channelPlan"] == plan].sort_values("nStaPerCell")
-        if sub.empty:
-            continue
-        x = sub["nStaPerCell"].to_numpy()
-        y = sub["jain_mean"].to_numpy(dtype=float)
-        yerr = sub["jain_std"].fillna(0.0).to_numpy(dtype=float)
-        plt.errorbar(x, y, yerr=yerr, marker="o", capsize=3, label=f"{plan} (mean±std)")
-
-    plt.ylim(0.0, 1.05)
-    plt.xlabel("nStaPerCell")
-    plt.ylabel("Jain Fairness (between 2 cells)")
-    plt.title("P7: Jain Fairness vs nStaPerCell")
-    plt.grid(True, which="both")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / "jain_vs_n.png", dpi=200)
-    plt.close()
+def read_csv_robust(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing CSV: {path}")
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        # more forgiving
+        return pd.read_csv(path, engine="python")
 
 
-# -------------------------- Per-STA plots (N=10) --------------------------
-def _persta_df(perflow: Dict[Tuple[str, int], pd.DataFrame], n: int) -> Optional[pd.DataFrame]:
+# -------------------- Mandatory plots --------------------
+def figure1_goodput_total_vs_n(summary: pd.DataFrame, out_dir: Path, strict_png: bool) -> None:
+    must_cols(summary, ["channelPlan", "nStaPerCell", "goodputTotal"])
+    df = summary.copy()
+
+    df["plan"] = df["channelPlan"].apply(plan_pretty)
+    df["N"] = pd.to_numeric(df["nStaPerCell"], errors="coerce")
+    df["goodputTotal_Mbps"] = bps_to_mbps(df["goodputTotal"])
+
     rows = []
-    for (plan, nn), df in perflow.items():
-        if nn != n:
+    for (plan, n), g in df.groupby(["plan", "N"], dropna=True):
+        m, s, cnt = mean_std(g["goodputTotal_Mbps"])
+        rows.append({"plan": plan, "N": n, "mean": m, "std": s, "count": cnt})
+    agg = pd.DataFrame(rows).dropna(subset=["N"]).sort_values(["plan", "N"])
+
+    fig = go.Figure()
+    for plan, g in agg.groupby("plan"):
+        g = g.sort_values("N")
+        fig.add_trace(
+            go.Scatter(
+                x=g["N"],
+                y=g["mean"],
+                mode="lines+markers",
+                name=plan,
+                error_y=dict(type="data", array=g["std"].fillna(0.0)),
+                hovertemplate="N=%{x}<br>Total=%{y:.3f} Mbps<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="P7 - Figure 1: Total goodput vs N (co-canal vs séparé)",
+        xaxis_title="N (stations per cell)",
+        yaxis_title="Total goodput (Mbps)",
+        template="plotly_white",
+        hovermode="x unified",
+        legend_title="Channel plan",
+    )
+    save_fig_safe(fig, out_dir, "p7_fig1_total_goodput_vs_n", strict_png)
+
+
+def figure2_goodput_per_cell_bars(summary: pd.DataFrame, out_dir: Path, strict_png: bool) -> None:
+    must_cols(summary, ["channelPlan", "nStaPerCell", "goodputCell1", "goodputCell2"])
+    df = summary.copy()
+
+    df["plan"] = df["channelPlan"].apply(plan_pretty)
+    df["N"] = pd.to_numeric(df["nStaPerCell"], errors="coerce")
+    df["cell1_Mbps"] = bps_to_mbps(df["goodputCell1"])
+    df["cell2_Mbps"] = bps_to_mbps(df["goodputCell2"])
+
+    Ns = sorted([int(x) for x in df["N"].dropna().unique().tolist()])
+
+    for n in Ns:
+        gN = df[df["N"] == n].copy()
+        if gN.empty:
             continue
-        tmp = df.copy()
-        tmp["plan"] = plan
-        tmp["goodputMbps"] = mbps(tmp["goodputbps"])
-        tmp["label"] = tmp.apply(lambda r: f"C{int(r['cellId'])}-S{int(r['staId'])}", axis=1)
-        rows.append(tmp[["plan", "cellId", "staId", "label", "goodputMbps"]])
+
+        rows = []
+        for plan, g in gN.groupby("plan"):
+            m1, s1, _ = mean_std(g["cell1_Mbps"])
+            m2, s2, _ = mean_std(g["cell2_Mbps"])
+            rows.append({"plan": plan, "cell": "Cell 1", "mean": m1, "std": s1})
+            rows.append({"plan": plan, "cell": "Cell 2", "mean": m2, "std": s2})
+        agg = pd.DataFrame(rows)
+
+        fig = go.Figure()
+        for cell, gc in agg.groupby("cell"):
+            fig.add_trace(
+                go.Bar(
+                    x=gc["plan"],
+                    y=gc["mean"],
+                    error_y=dict(type="data", array=gc["std"].fillna(0.0)),
+                    name=cell,
+                    hovertemplate="plan=%{x}<br>goodput=%{y:.3f} Mbps<extra></extra>",
+                )
+            )
+
+        fig.update_layout(
+            title=f"P7 - Figure 2: Per-cell goodput (N={n})",
+            xaxis_title="Channel plan",
+            yaxis_title="Goodput (Mbps)",
+            barmode="group",
+            template="plotly_white",
+        )
+        save_fig_safe(fig, out_dir, f"p7_fig2_percell_goodput_n{n}", strict_png)
+
+
+def figure3_jain_vs_n(summary: pd.DataFrame, out_dir: Path, strict_png: bool) -> None:
+    must_cols(summary, ["channelPlan", "nStaPerCell", "jainCells"])
+    df = summary.copy()
+
+    df["plan"] = df["channelPlan"].apply(plan_pretty)
+    df["N"] = pd.to_numeric(df["nStaPerCell"], errors="coerce")
+    df["jain"] = pd.to_numeric(df["jainCells"], errors="coerce")
+
+    rows = []
+    for (plan, n), g in df.groupby(["plan", "N"], dropna=True):
+        m, s, cnt = mean_std(g["jain"])
+        rows.append({"plan": plan, "N": n, "mean": m, "std": s, "count": cnt})
+    agg = pd.DataFrame(rows).dropna(subset=["N"]).sort_values(["plan", "N"])
+
+    fig = go.Figure()
+    for plan, g in agg.groupby("plan"):
+        g = g.sort_values("N")
+        fig.add_trace(
+            go.Scatter(
+                x=g["N"],
+                y=g["mean"],
+                mode="lines+markers",
+                name=plan,
+                error_y=dict(type="data", array=g["std"].fillna(0.0)),
+                hovertemplate="N=%{x}<br>Jain=%{y:.4f}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="P7 - Figure 3: Jain fairness between cells vs N",
+        xaxis_title="N (stations per cell)",
+        yaxis_title="Jain index (0..1)",
+        template="plotly_white",
+        hovermode="x unified",
+        legend_title="Channel plan",
+        yaxis=dict(range=[0, 1.05]),
+    )
+    save_fig_safe(fig, out_dir, "p7_fig3_jain_vs_n", strict_png)
+
+
+# -------------------- Recommended plots (per-flow) --------------------
+def load_perflow(raw_dir: Path) -> pd.DataFrame | None:
+    """
+    Supports:
+      1) raw/perflow/perflow_*.csv (preferred)
+      2) raw/perflow_all.csv (optional consolidated)
+    """
+    perflow_dir = raw_dir / "perflow"
+    rows: list[pd.DataFrame] = []
+
+    # 1) raw/perflow/perflow_*.csv
+    if perflow_dir.exists():
+        files = sorted(perflow_dir.glob("perflow_*.csv"))
+        for f in files:
+            # expected name: perflow_{plan}_n{N}_run{run}.csv
+            m = re.match(r"perflow_(\w+)_n(\d+)_run(\d+)\.csv", f.name)
+            if not m:
+                continue
+            plan, n, run = m.group(1), int(m.group(2)), int(m.group(3))
+            df = read_csv_robust(f)
+            if df.empty:
+                continue
+            if not {"cellId", "staId", "goodputbps"}.issubset(set(df.columns)):
+                continue
+            df = df.copy()
+            df["plan"] = plan_pretty(plan)
+            df["N"] = n
+            df["run"] = run
+            df["goodput_Mbps"] = bps_to_mbps(df["goodputbps"])
+            rows.append(df[["plan", "N", "run", "cellId", "staId", "goodput_Mbps"]])
+
+    # 2) raw/perflow_all.csv (fallback)
+    perflow_all = raw_dir / "perflow_all.csv"
+    if not rows and perflow_all.exists():
+        df = read_csv_robust(perflow_all)
+        if {"cellId", "staId", "goodputbps"}.issubset(set(df.columns)):
+            df = df.copy()
+            df["plan"] = "unknown"
+            df["N"] = np.nan
+            df["run"] = np.nan
+            df["goodput_Mbps"] = bps_to_mbps(df["goodputbps"])
+            rows.append(df[["plan", "N", "run", "cellId", "staId", "goodput_Mbps"]])
+
     if not rows:
         return None
-    out = pd.concat(rows, ignore_index=True)
-    # collapse duplicates just in case
-    out = out.groupby(["plan", "cellId", "staId", "label"], as_index=False)["goodputMbps"].mean()
-    return out
+    return pd.concat(rows, ignore_index=True)
 
 
-def plot_per_sta_bars(perflow: Dict[Tuple[str, int], pd.DataFrame], n: int = 10) -> None:
-    all_df = _persta_df(perflow, n)
-    if all_df is None:
+def recommended_violin_persta(perflow: pd.DataFrame, out_dir: Path, strict_png: bool) -> None:
+    if perflow is None or perflow.empty:
         return
 
-    plans = ["cocanal", "separe"]
-    labels = sorted(
-        all_df["label"].unique(),
-        key=lambda s: (int(s.split("-")[0][1:]), int(s.split("-")[1][1:]))
-    )
-
-    x = np.arange(len(labels))
-    width = 0.35
-
-    plt.figure(figsize=(max(10, len(labels) * 0.55), 5))
-    for i, plan in enumerate(plans):
-        sub = all_df[all_df["plan"] == plan].set_index("label")["goodputMbps"]
-        y = [float(sub.loc[l]) if l in sub.index else 0.0 for l in labels]
-        plt.bar(x + (i - 0.5) * width, y, width=width, label=plan)
-
-    plt.xticks(x, labels, rotation=45, ha="right")
-    plt.ylabel("Per-STA Goodput (Mbps)")
-    plt.title(f"P7: Per-STA Goodput (Bar) for nStaPerCell={n}")
-    plt.grid(True, axis="y")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / f"per_sta_bars_n{n}.png", dpi=200)
-    plt.close()
-
-
-def plot_per_sta_box(perflow: Dict[Tuple[str, int], pd.DataFrame], n: int = 10) -> None:
-    data = []
-    labels = []
-    for plan in ["cocanal", "separe"]:
-        key = (plan, n)
-        if key not in perflow:
-            continue
-        vals = mbps(perflow[key]["goodputbps"])
-        if len(vals) == 0:
-            continue
-        data.append(vals)
-        labels.append(plan)
-
-    if not data:
-        return
-
-    plt.figure()
-    plt.boxplot(data, labels=labels, showmeans=True)
-    plt.ylabel("Per-STA Goodput (Mbps)")
-    plt.title(f"P7: Per-STA Goodput Distribution (Box) for nStaPerCell={n}")
-    plt.grid(True, axis="y")
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / f"per_sta_box_n{n}.png", dpi=200)
-    plt.close()
-
-
-def plot_per_sta_cdf(perflow: Dict[Tuple[str, int], pd.DataFrame], n: int = 10) -> None:
-    plt.figure()
-    plotted = False
-
-    for plan in ["cocanal", "separe"]:
-        key = (plan, n)
-        if key not in perflow:
-            continue
-        vals = np.sort(mbps(perflow[key]["goodputbps"]))
-        if len(vals) == 0:
-            continue
-        y = np.arange(1, len(vals) + 1) / len(vals)
-        plt.plot(vals, y, marker="o", linestyle="-", label=plan)
-        plotted = True
-
-    if not plotted:
-        plt.close()
-        return
-
-    plt.xlabel("Per-STA Goodput (Mbps)")
-    plt.ylabel("CDF")
-    plt.title(f"P7: CDF of Per-STA Goodput for nStaPerCell={n}")
-    plt.grid(True, which="both")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / f"per_sta_cdf_n{n}.png", dpi=200)
-    plt.close()
-
-
-def plot_per_sta_ecdf_by_cell(perflow: Dict[Tuple[str, int], pd.DataFrame], n: int = 10) -> None:
-    all_df = _persta_df(perflow, n)
-    if all_df is None:
-        return
-
-    plt.figure()
-    plotted = False
-
-    for plan in ["cocanal", "separe"]:
-        for cell in [1, 2]:
-            sub = all_df[(all_df["plan"] == plan) & (all_df["cellId"] == cell)]
-            if sub.empty:
-                continue
-            vals = np.sort(sub["goodputMbps"].to_numpy(dtype=float))
-            y = np.arange(1, len(vals) + 1) / len(vals)
-            plt.plot(vals, y, marker="o", linestyle="-", label=f"{plan}-cell{cell}")
-            plotted = True
-
-    if not plotted:
-        plt.close()
-        return
-
-    plt.xlabel("Per-STA Goodput (Mbps)")
-    plt.ylabel("CDF")
-    plt.title(f"P7: CDF of Per-STA Goodput by Cell (nStaPerCell={n})")
-    plt.grid(True, which="both")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / f"per_sta_ecdf_by_cell_n{n}.png", dpi=200)
-    plt.close()
-
-
-def plot_per_sta_box_by_cell(perflow: Dict[Tuple[str, int], pd.DataFrame], n: int = 10) -> None:
-    all_df = _persta_df(perflow, n)
-    if all_df is None:
-        return
-
-    data = []
-    labels = []
-
-    for plan in ["cocanal", "separe"]:
-        for cell in [1, 2]:
-            sub = all_df[(all_df["plan"] == plan) & (all_df["cellId"] == cell)]
-            if sub.empty:
-                continue
-            data.append(sub["goodputMbps"].to_numpy(dtype=float))
-            labels.append(f"{plan}-cell{cell}")
-
-    if not data:
-        return
-
-    plt.figure(figsize=(max(8, len(labels) * 1.2), 5))
-    plt.boxplot(data, labels=labels, showmeans=True)
-    plt.ylabel("Per-STA Goodput (Mbps)")
-    plt.title(f"P7: Per-STA Goodput Distribution by Cell (Box) for nStaPerCell={n}")
-    plt.grid(True, axis="y")
-    plt.xticks(rotation=30, ha="right")
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / f"per_sta_box_by_cell_n{n}.png", dpi=200)
-    plt.close()
-
-
-# -------------------------- Main --------------------------
-def main() -> int:
-    ensure_dirs()
-
-    df = read_summary()
-
-    # Required / core plots
-    plot_total_goodput(df)
-    plot_cells_goodput(df)
-    plot_jain(df)
-
-    # Per-STA plots (latest run per key)
-    perflow = read_perflow_latest()
-    if not perflow:
-        print("[plot_p7] NOTE: No perflow_*.csv found; per-STA plots will be skipped.")
+    # Choose largest N if known; otherwise use all
+    Ns = sorted([int(x) for x in perflow["N"].dropna().unique().tolist()]) if "N" in perflow.columns else []
+    if Ns:
+        Nmax = Ns[-1]
+        g = perflow[perflow["N"] == Nmax].copy()
+        title_n = f"(N={Nmax})"
+        stem = f"p7_rec_violin_persta_n{Nmax}"
     else:
-        plot_per_sta_bars(perflow, n=10)
-        plot_per_sta_box(perflow, n=10)
-        plot_per_sta_cdf(perflow, n=10)
-        plot_per_sta_ecdf_by_cell(perflow, n=10)
-        plot_per_sta_box_by_cell(perflow, n=10)
+        g = perflow.copy()
+        title_n = "(all N)"
+        stem = "p7_rec_violin_persta_all"
 
-    print("[plot_p7] Done. Plots saved in:", PLOTS_DIR)
-    for p in sorted(PLOTS_DIR.glob("*.png")):
-        print(" -", p.relative_to(ROOT))
+    if g.empty:
+        return
+
+    g["cell"] = g["cellId"].apply(lambda c: f"Cell {int(c)+1}" if pd.notna(c) else "Cell ?")
+    g["group"] = g["plan"].astype(str) + " | " + g["cell"].astype(str)
+
+    fig = go.Figure()
+    for grp, gg in g.groupby("group"):
+        fig.add_trace(
+            go.Violin(
+                y=gg["goodput_Mbps"],
+                name=grp,
+                box_visible=True,
+                meanline_visible=True,
+                points="outliers",
+                hovertemplate="goodput=%{y:.3f} Mbps<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title=f"P7 (Recommended) - Per-STA goodput distribution {title_n}",
+        yaxis_title="Per-STA goodput (Mbps)",
+        template="plotly_white",
+    )
+    save_fig_safe(fig, out_dir, stem, strict_png)
+
+
+# -------------------- Main --------------------
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Plot Project 7 (channel planning) results.")
+    ap.add_argument("--results", type=str, default=None, help="Path to results/p7 (default: <repo>/results/p7)")
+    ap.add_argument("--strict-png", action="store_true", help="Fail if PNG export fails (requires kaleido).")
+    args = ap.parse_args()
+
+    res_dir = resolve_results_dir(args.results, "p7")
+    raw_dir = res_dir / "raw"
+    plot_dir = res_dir / "plots"
+    ensure_dir(plot_dir)
+
+    summary_path = raw_dir / "p7_summary.csv"
+    if not summary_path.exists():
+        print(f"[P7] ERROR: Missing: {summary_path}", file=sys.stderr)
+        print("Run: ./scripts/run_p7.sh", file=sys.stderr)
+        return 2
+
+    summary = read_csv_robust(summary_path)
+
+    # Mandatory
+    figure1_goodput_total_vs_n(summary, plot_dir, args.strict_png)
+    figure2_goodput_per_cell_bars(summary, plot_dir, args.strict_png)
+    figure3_jain_vs_n(summary, plot_dir, args.strict_png)
+
+    # Recommended (if exists)
+    perflow = load_perflow(raw_dir)
+    if perflow is not None and not perflow.empty:
+        recommended_violin_persta(perflow, plot_dir, args.strict_png)
+
+    print("[OK] P7 plots saved to:", plot_dir)
     return 0
 
 

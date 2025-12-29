@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # scripts/run_p4.sh
-#  Part 4 runner (parallel, per-run tmp outDir, safe merge) — FIXED wait/failure handling
+# Part 4 runner (parallel, per-run raw only, safe merge)
+#
+# Output layout:
+#   results/p4/
+#     logs/   -> build.log, prog_help.log, <tag>.log, plots.log
+#     plots/  -> plot_p4 outputs
+#     raw/
+#       p4_matrix.csv
+#       per_run/<tag>/   (RAW FILES ONLY)
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -19,31 +27,36 @@ OUTDIR="${OUTDIR:-$ROOT_DIR/results/p4}"
 RAW_DIR="$OUTDIR/raw"
 LOG_DIR="$OUTDIR/logs"
 PLOT_DIR="$OUTDIR/plots"
-TMP_ROOT="$OUTDIR/tmp_runs"
+
+PER_RUN_DIR="$RAW_DIR/per_run"
 
 CSV_OUT="$RAW_DIR/p4_matrix.csv"
 CSV_HEADER="distance,channelWidth,txPowerDbm,rateMode,mcs,udpRate,pktSize,seed,run,rxBytes,goodputMbps,rttMeanMs"
 
-CLEAN="${CLEAN:-true}"
-KEEP_TMP="${KEEP_TMP:-false}"
+# Clean policy:
+# - "all": wipe raw/logs/plots
+# - "soft": wipe raw/logs/plots (same behavior here; kept for compatibility)
+CLEAN_MODE="${CLEAN_MODE:-soft}"          # soft|all
 STOP_ON_FIRST_FAIL="${STOP_ON_FIRST_FAIL:-false}"
-
-# ---- CPU/thermal knobs ----
-BUILD_JOBS="${BUILD_JOBS:-2}"
 TAIL_LINES="${TAIL_LINES:-120}"
 
-JOBS="${JOBS:-6}"
-MAX_JOBS="${MAX_JOBS:-6}"
+# Python venv (no installs here)
+VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
+PY="$VENV_DIR/bin/python"
+STRICT_PNG="${STRICT_PNG:-false}"
 
-LOAD_MAX="${LOAD_MAX:-}"                 # e.g. 4.0 ; empty => ~0.75*cores
-LAUNCH_STAGGER_MS="${LAUNCH_STAGGER_MS:-250}"
+# ---- CPU knobs ----
+BUILD_JOBS="${BUILD_JOBS:-2}"
+JOBS="${JOBS:-}"              # if empty => auto: min(MAX_JOBS, max(1, nproc/2))
+MAX_JOBS="${MAX_JOBS:-6}"
+LOAD_MAX="${LOAD_MAX:-}"      # empty => ~0.75*cores
+BACKOFF_SLEEP_SEC="${BACKOFF_SLEEP_SEC:-1}"
+LAUNCH_STAGGER_MS="${LAUNCH_STAGGER_MS:-200}"
 
 NICE_LEVEL="${NICE_LEVEL:-15}"
 IONICE_CLASS="${IONICE_CLASS:-2}"
 IONICE_LEVEL="${IONICE_LEVEL:-7}"
-
-CPULIMIT_PCT="${CPULIMIT_PCT:-8}"
-BACKOFF_SLEEP_SEC="${BACKOFF_SLEEP_SEC:-1}"
+CPULIMIT_PCT="${CPULIMIT_PCT:-}"          # empty => disabled
 
 # -------------------- Sweep parameters --------------------
 DISTANCES_STR="${DISTANCES:-5 10 20 30}"
@@ -59,17 +72,21 @@ RUN_BASE="${RUN_BASE:-1}"
 
 UDP_RATE="${UDP_RATE:-600Mbps}"
 PKT_SIZE="${PKT_SIZE:-1200}"
+
 LOG_EXP="${LOG_EXP:-3.0}"
 REF_DIST="${REF_DIST:-1.0}"
 REF_LOSS="${REF_LOSS:-46.6777}"
+
 NOISE_FIGURE_DB="${NOISE_FIGURE_DB:-7.0}"
 ENABLE_SHADOWING="${ENABLE_SHADOWING:-false}"
 SHADOW_SIGMA_DB="${SHADOW_SIGMA_DB:-5.0}"
 SHADOW_UPDATE_S="${SHADOW_UPDATE_S:-1.0}"
 ENABLE_FADING="${ENABLE_FADING:-false}"
+
 RTT_HZ="${RTT_HZ:-2.0}"
 RTT_PAYLOAD_SIZE="${RTT_PAYLOAD_SIZE:-32}"
 RTT_VERBOSE="${RTT_VERBOSE:-false}"
+
 PCAP="${PCAP:-false}"
 FLOWMON="${FLOWMON:-true}"
 USE_MINSTREL="${USE_MINSTREL:-true}"
@@ -84,12 +101,13 @@ warn() { echo "[$(ts)] WARN: $*" >&2; }
 die()  { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 
-ensure_dirs() { mkdir -p "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR"; }
+ensure_dirs() { mkdir -p "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$PER_RUN_DIR"; }
 
 clean_outputs() {
-  log "[P4] Cleaning outputs under: $OUTDIR"
-  rm -rf "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" "$TMP_ROOT" || true
+  log "[P4] Cleaning previous outputs under: $OUTDIR (mode=$CLEAN_MODE)"
+  rm -rf "$RAW_DIR" "$LOG_DIR" "$PLOT_DIR" || true
   ensure_dirs
 }
 
@@ -102,7 +120,7 @@ stage_scenario() {
 }
 
 build_ns3_low_heat() {
-  log "[P4] Building ns-3 (low-heat): -j${BUILD_JOBS}"
+  log "[P4] Building ns-3"
   local build_log="$LOG_DIR/build.log"
   ( cd "$NS3_DIR" && NINJAFLAGS="-j${BUILD_JOBS}" ./ns3 build ) >"$build_log" 2>&1 || {
     warn "[P4] BUILD FAILED. Last ${TAIL_LINES} lines:"
@@ -118,7 +136,7 @@ get_prog_help() {
     true
   else
     ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} --PrintHelp" ) >"$help_log" 2>&1 || {
-      warn "[P4] Could not fetch program help (see $help_log). Will run without arg-filtering."
+      warn "[P4] Could not fetch program help (see $help_log)."
       : > "$help_log"
     }
   fi
@@ -126,8 +144,7 @@ get_prog_help() {
 }
 
 arg_supported() {
-  local help_file="$1"
-  local argname="$2"
+  local help_file="$1" argname="$2"
   [[ -s "$help_file" ]] || return 1
   grep -q -- "--${argname}:" "$help_file"
 }
@@ -160,7 +177,7 @@ merge_matrix_csv() {
     else
       cat "$f" >> "$CSV_OUT" || true
     fi
-  done < <(find "$TMP_ROOT" -type f -name "p4_matrix.csv" | sort)
+  done < <(find "$PER_RUN_DIR" -type f -name "p4_matrix.csv" | sort)
   log "[P4] Merge -> $CSV_OUT"
 }
 
@@ -188,11 +205,21 @@ PY
 
 wait_for_slot_and_load() {
   while true; do
-    if (( $(jobs -rp | wc -l) >= JOBS )); then
-      # wait one job to free a slot
-      wait -n || true
+    if (( running >= JOBS )); then
+      if wait -n; then
+        running=$((running-1))
+      else
+        fail=1
+        running=$((running-1))
+        if [[ "$STOP_ON_FIRST_FAIL" == "true" ]]; then
+          warn "[P4] STOP_ON_FIRST_FAIL=true -> stopping remaining jobs."
+          kill_children
+          break
+        fi
+      fi
       continue
     fi
+
     if [[ "$(load_ok)" == "1" ]]; then
       break
     fi
@@ -211,7 +238,7 @@ run_cmd_wrapped() {
     cmd=( nice -n "$NICE_LEVEL" "${cmd[@]}" )
   fi
 
-  if have_cmd cpulimit; then
+  if have_cmd cpulimit && [[ -n "${CPULIMIT_PCT:-}" ]]; then
     cpulimit -l "$CPULIMIT_PCT" -- "${cmd[@]}" >"$run_log" 2>&1
   else
     "${cmd[@]}" >"$run_log" 2>&1
@@ -261,7 +288,7 @@ build_args_for_run() {
     args+=( "--tag=${TAG_SUFFIX}" )
   fi
 
-  # Optional: filter EXTRA_ARGS against --PrintHelp
+  # Filter EXTRA_ARGS against --PrintHelp (best-effort)
   if [[ -n "$EXTRA_ARGS" ]] && [[ -s "$help_file" ]]; then
     local IFS=' '
     # shellcheck disable=SC2206
@@ -280,7 +307,6 @@ build_args_for_run() {
       fi
     done
   elif [[ -n "$EXTRA_ARGS" ]]; then
-    # No help available: pass as-is
     local IFS=' '
     # shellcheck disable=SC2206
     args+=( $EXTRA_ARGS )
@@ -289,24 +315,27 @@ build_args_for_run() {
   echo "${args[*]}"
 }
 
-flatten_outdir() {
+normalize_per_run_raw_only() {
+  # Goal: inside $out_run/ keep ONLY raw files (no raw/, logs/, plots/)
   local out_run="$1"
-  local sub
-  for sub in raw logs plots; do
-    if [[ -d "$out_run/$sub" ]]; then
-      shopt -s dotglob nullglob
-      mv "$out_run/$sub"/* "$out_run/" 2>/dev/null || true
-      shopt -u dotglob nullglob
-      rmdir "$out_run/$sub" 2>/dev/null || true
-    fi
-  done
+
+  # If scenario created out_run/raw, move its contents to out_run/
+  if [[ -d "$out_run/raw" ]]; then
+    shopt -s dotglob nullglob
+    mv "$out_run/raw"/* "$out_run/" 2>/dev/null || true
+    shopt -u dotglob nullglob
+    rm -rf "$out_run/raw" 2>/dev/null || true
+  fi
+
+  # If scenario created logs/plots under out_run, DO NOT keep them in per_run.
+  rm -rf "$out_run/logs" "$out_run/plots" 2>/dev/null || true
 }
 
 run_one() {
   local tag="$1" args="$2" seq="$3" total="$4" out_run="$5"
   local run_log="$LOG_DIR/${tag}.log"
 
-  log "[P4] [${seq}/${total}] RUN start  ${tag}"
+  log "[P4] [${seq}/${total}] RUN start ${tag}"
 
   if ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" --no-build ) >/dev/null 2>&1; then
     run_cmd_wrapped "$run_log" bash -lc "cd \"$NS3_DIR\" && ./ns3 run \"${SCENARIO} ${args}\" --no-build"
@@ -316,19 +345,17 @@ run_one() {
 
   local rc=$?
   if (( rc != 0 )); then
-    warn "[P4] RUN FAILED: $tag (rc=$rc)"
-    warn "[P4] Log file: $run_log"
+    warn "[P4] RUN FAILED: $tag (rc=$rc) (see $run_log)"
     tail -n "$TAIL_LINES" "$run_log" || true
     return "$rc"
   fi
 
-  flatten_outdir "$out_run"
-  log "[P4] [${seq}/${total}] RUN ok     ${tag}"
+  normalize_per_run_raw_only "$out_run"
+  log "[P4] [${seq}/${total}] RUN ok    ${tag}"
   return 0
 }
 
 kill_children() {
-  # Kill any remaining background jobs when exiting early
   jobs -rp >/dev/null 2>&1 || return 0
   local pids
   pids="$(jobs -rp | tr '\n' ' ' || true)"
@@ -337,22 +364,88 @@ kill_children() {
 }
 trap 'kill_children' EXIT INT TERM
 
+# ---------------------------- Plot helpers ----------------------------
+ensure_venv(){
+  if [[ ! -x "$PY" ]]; then
+    need_cmd python3
+    log "[P4] Creating venv at: $VENV_DIR (no package install performed)"
+    python3 -m venv "$VENV_DIR" || die "Failed to create venv: $VENV_DIR"
+  fi
+}
+
+check_plot_deps_or_die(){
+  "$PY" - <<'PY'
+import importlib, sys
+required = ["numpy","pandas","plotly","kaleido"]
+missing=[]
+for name in required:
+    try:
+        importlib.import_module(name)
+    except Exception:
+        missing.append(name)
+
+if missing:
+    print("[P4] ERROR: Missing Python packages in venv: " + ", ".join(missing), file=sys.stderr)
+    print("[P4] Install:", file=sys.stderr)
+    print("  source .venv/bin/activate", file=sys.stderr)
+    print("  python -m pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(2)
+PY
+}
+
+run_plots(){
+  [[ -f "$ROOT_DIR/scripts/plot_p4.py" ]] || die "Plot script not found: $ROOT_DIR/scripts/plot_p4.py"
+  local plot_log="$LOG_DIR/plots.log"
+
+  log "[P4] [1/1] PLOT start p4_plots"
+  if [[ "$STRICT_PNG" == "true" ]]; then
+    if "$PY" "$ROOT_DIR/scripts/plot_p4.py" --results "$OUTDIR" --strict-png >"$plot_log" 2>&1; then
+      log "[P4] [1/1] PLOT ok    p4_plots"
+    else
+      warn "[P4] PLOT FAILED (see $plot_log)"
+      tail -n "$TAIL_LINES" "$plot_log" || true
+      return 1
+    fi
+  else
+    if "$PY" "$ROOT_DIR/scripts/plot_p4.py" --results "$OUTDIR" >"$plot_log" 2>&1; then
+      log "[P4] [1/1] PLOT ok    p4_plots"
+    else
+      warn "[P4] PLOT FAILED (see $plot_log)"
+      tail -n "$TAIL_LINES" "$plot_log" || true
+      return 1
+    fi
+  fi
+}
+
 # -------------------- main --------------------
 main() {
-  if (( JOBS > MAX_JOBS )); then JOBS="$MAX_JOBS"; fi
-  if (( JOBS < 1 )); then JOBS=1; fi
-  if (( BUILD_JOBS < 1 )); then BUILD_JOBS=1; fi
+  need_cmd find
+  need_cmd tail
+  need_cmd grep
+  need_cmd wc
 
-  ensure_dirs
-  if [[ "$CLEAN" == "true" ]]; then clean_outputs; fi
-  mkdir -p "$TMP_ROOT"
+  if [[ "$CLEAN_MODE" == "soft" || "$CLEAN_MODE" == "all" ]]; then
+    clean_outputs
+  else
+    ensure_dirs
+  fi
+
+  # Default JOBS if not set: min(MAX_JOBS, max(1, nproc/2))
+  if [[ -z "${JOBS:-}" ]]; then
+    local n=1
+    if command -v nproc >/dev/null 2>&1; then n="$(nproc)"; fi
+    local half=$(( n / 2 )); (( half < 1 )) && half=1
+    JOBS="$half"
+  fi
+  (( JOBS > MAX_JOBS )) && JOBS="$MAX_JOBS"
+  (( JOBS < 1 )) && JOBS=1
+  (( BUILD_JOBS < 1 )) && BUILD_JOBS=1
 
   stage_scenario
   build_ns3_low_heat
 
   local help_file
   help_file="$(get_prog_help)"
-  log "[P4] Program help captured: $help_file"
 
   local -a DISTANCES WIDTHS POWERS RATE_MODES MCS_LIST
   to_array "$DISTANCES_STR" DISTANCES
@@ -381,25 +474,12 @@ main() {
 
   local total="${#jobs_list[@]}"
   (( total > 0 )) || die "[P4] No runs to execute."
-  if (( total == 1 )); then JOBS=1; fi
 
-  local cores; cores="$(get_cores)"
-  if [[ -z "${LOAD_MAX}" ]]; then
-    log "[P4] Load-aware throttle: LOAD_MAX not set -> default ~0.75*cores (cores=$cores)"
-  else
-    log "[P4] Load-aware throttle: LOAD_MAX=${LOAD_MAX}"
-  fi
+  # NOTE: these are used inside wait_for_slot_and_load()
+  running=0
+  fail=0
 
-  log "[P4] Runs: total=${total}, max parallel JOBS=${JOBS}"
-  if have_cmd cpulimit; then
-    log "[P4] Thermal control: cpulimit per job = ${CPULIMIT_PCT}%"
-  else
-    log "[P4] Thermal control: cpulimit not found (using nice/ionice + load throttle)"
-  fi
-
-  # ---- FIXED: robust failure tracking without "no child processes" false-fails ----
   local idx=0 run_num tag out_run args item
-  local fail=0
 
   for item in "${jobs_list[@]}"; do
     IFS='|' read -r d w p rm m <<< "$item"
@@ -407,16 +487,16 @@ main() {
     run_num=$((RUN_BASE + idx - 1))
 
     tag="$(safe_tag "$d" "$w" "$p" "$rm" "$m" "$SEED" "$run_num")"
-    out_run="$TMP_ROOT/$tag"
+    out_run="$PER_RUN_DIR/$tag"
     mkdir -p "$out_run"
 
     args="$(build_args_for_run "$help_file" "$out_run" "$d" "$w" "$p" "$rm" "$m" "$run_num")"
 
     wait_for_slot_and_load
+    [[ "$STOP_ON_FIRST_FAIL" == "true" && "$fail" -ne 0 ]] && break
 
-    (
-      run_one "$tag" "$args" "$idx" "$total" "$out_run"
-    ) &
+    ( run_one "$tag" "$args" "$idx" "$total" "$out_run" ) &
+    running=$((running+1))
 
     if (( LAUNCH_STAGGER_MS > 0 )); then
       python3 - <<PY >/dev/null 2>&1 || true
@@ -426,10 +506,13 @@ PY
     fi
   done
 
-  # Collect all remaining jobs; mark fail if any fails.
-  while (( $(jobs -rp | wc -l) > 0 )); do
-    if ! wait -n; then
+  # Drain remaining jobs
+  while (( running > 0 )); do
+    if wait -n; then
+      running=$((running-1))
+    else
       fail=1
+      running=$((running-1))
       if [[ "$STOP_ON_FIRST_FAIL" == "true" ]]; then
         warn "[P4] STOP_ON_FIRST_FAIL=true -> stopping remaining jobs."
         kill_children
@@ -440,44 +523,12 @@ PY
 
   merge_matrix_csv
 
-  mkdir -p "$RAW_DIR/per_run_raw"
-  if have_cmd rsync; then
-    rsync -a --delete "$TMP_ROOT/" "$RAW_DIR/per_run_raw/" >/dev/null 2>&1 || true
-  else
-    rm -rf "$RAW_DIR/per_run_raw" || true
-    mkdir -p "$RAW_DIR/per_run_raw"
-    cp -a "$TMP_ROOT/." "$RAW_DIR/per_run_raw/" 2>/dev/null || true
-  fi
+  ensure_venv
+  check_plot_deps_or_die
+  run_plots
 
-  if [[ "$KEEP_TMP" != "true" ]]; then
-    rm -rf "$TMP_ROOT" || true
-  else
-    log "[P4] KEEP_TMP=true (tmp runs kept at: $TMP_ROOT)"
-  fi
-
-  cat <<EOF
-
-====================== [P4] Summary ======================
-NS3_DIR : $NS3_DIR
-Scenario: $SCENARIO
-Source  : $SCEN_SRC
-OutDir  : $OUTDIR
-Raw     : $RAW_DIR
-Logs    : $LOG_DIR
-Plots   : $PLOT_DIR
-----------------------------------------------------------
-Key outputs:
-  - $CSV_OUT
-  - per-run artifacts under $RAW_DIR/per_run_raw/
-==========================================================
-
-EOF
-
-  if (( fail != 0 )); then
-    die "[P4] One or more runs failed (see $LOG_DIR/*.log)."
-  fi
-
-  log "[P4] All runs completed successfully."
+  (( fail == 0 )) || die "[P4] One or more runs failed (see $LOG_DIR/*.log)."
+  log "[P4] Completed. Final CSV: $CSV_OUT"
 }
 
 main "$@"

@@ -2,6 +2,7 @@
 # scripts/run_p2.sh
 # Part 2 runner (safe per-run outDir + merge)
 # Runs UDP and TCP (optionally parallel) without overwriting fixed output filenames.
+# + Plot generation (HTML + safe PNG via plot_p2.py) using a local venv (no installs in shell)
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -19,6 +20,10 @@ RAW_DIR="$OUTDIR/raw"
 LOG_DIR="$OUTDIR/logs"
 PLOT_DIR="$OUTDIR/plots"
 TMP_ROOT="$OUTDIR/tmp_runs"
+
+# Python venv (no installs here)
+VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
+PY="$VENV_DIR/bin/python"
 
 # ---------------------------- Parallelism ----------------------------
 # Only 2 runs (udp/tcp). Parallelism is optional.
@@ -112,17 +117,48 @@ common_args(){
 }
 
 run_one(){
-  local tag="$1" args="$2" seq="$3" total="$4"
+  # run_one <tag> <out_run> <args> <seq> <total>
+  local tag="$1"
+  local out_run="$2"
+  local args="$3"
+  local seq="$4"
+  local total="$5"
+
   local run_log="$LOG_DIR/${tag}.log"
+
   log "[P2] [${seq}/${total}] RUN start  ${tag}"
-  ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" ) >"$run_log" 2>&1 || {
+
+  if ( cd "$NS3_DIR" && ./ns3 run "${SCENARIO} ${args}" ) >"$run_log" 2>&1; then
+    log "[P2] [${seq}/${total}] RUN ok     ${tag}"
+    # keep a per-run copy of the console log
+    mkdir -p "$out_run/logs"
+    cp -f "$run_log" "$out_run/logs/console.log" || true
+    return 0
+  else
     warn "[P2] RUN FAILED: ${tag} (see $run_log)"
     tail -n 120 "$run_log" || true
+    # keep a per-run copy of the console log even on failure
+    mkdir -p "$out_run/logs"
+    cp -f "$run_log" "$out_run/logs/console.log" || true
     return 1
-  }
-  log "[P2] [${seq}/${total}] RUN ok     ${tag}"
-  return 0
+  fi
 }
+
+
+
+count_png(){
+  local dir="$1"
+  [[ -d "$dir" ]] || { echo 0; return; }
+  find "$dir" -maxdepth 1 -type f -name '*.png' 2>/dev/null | wc -l | tr -d ' '
+}
+
+step_log(){
+  # step_log <idx> <total> <PHASE> <status> <name>
+  local i="$1" n="$2" phase="$3" status="$4" name="$5"
+  # status: start|ok|FAILED
+  log "[P2] [$i/$n] ${phase} ${status} ${name}"
+}
+
 
 # Merge helpers (same spirit as your P4/P5/P6)
 merge_plain(){
@@ -134,7 +170,6 @@ merge_plain(){
     [[ -s "$f" ]] || continue
     tail -n +2 "$f" >> "$master" || true
   done < <(find "$TMP_ROOT" -type f -path "$pattern" | sort)
-  log "[P2] Merge -> $master"
 }
 
 merge_timeseries_with_keys(){
@@ -145,7 +180,6 @@ merge_timeseries_with_keys(){
     [[ -d "$d" ]] || continue
     local tag; tag="$(basename "$d")"
 
-    # tag format: p2_<transport>_run<id>
     local transport="unknown" run="0"
     if [[ "$tag" =~ ^p2_([a-z]+)_run([0-9]+)$ ]]; then
       transport="${BASH_REMATCH[1]}"
@@ -156,15 +190,106 @@ merge_timeseries_with_keys(){
     [[ -s "$f" ]] || continue
     tail -n +2 "$f" | awk -v t="$transport" -v r="$run" -F',' 'NF>=2 {print t","r","$0}' >> "$master" || true
   done
-  log "[P2] Merge -> $master"
 }
 
-copy_per_run(){
-  local dest_sub="$1" pattern="$2"
-  local dest="$RAW_DIR/$dest_sub"
-  mkdir -p "$dest"
-  find "$TMP_ROOT" -type f -path "$pattern" -exec cp -f {} "$dest/" \; 2>/dev/null || true
+
+copy_per_run_tree(){
+  # Copy per-run directories preserving structure to avoid overwrite
+  local dest_root="$RAW_DIR/per_run"
+  mkdir -p "$dest_root"
+
+  local d
+  for d in "$TMP_ROOT"/*; do
+    [[ -d "$d" ]] || continue
+    local tag; tag="$(basename "$d")"
+    mkdir -p "$dest_root/$tag"
+    [[ -d "$d/raw" ]]  && cp -a "$d/raw"  "$dest_root/$tag/" || true
+    [[ -d "$d/logs" ]] && cp -a "$d/logs" "$dest_root/$tag/" || true
+  done
 }
+
+
+# ---------------------------- Plot helpers (NEW) ----------------------------
+ensure_venv(){
+  if [[ ! -x "$PY" ]]; then
+    need_cmd python3
+    log "[P2] Creating venv at: $VENV_DIR (no package install performed)"
+    python3 -m venv "$VENV_DIR" || die "Failed to create venv at: $VENV_DIR"
+  fi
+}
+
+check_plot_deps_or_die(){
+  "$PY" - <<'PY'
+import importlib, sys
+required = ["numpy", "pandas", "plotly", "kaleido"]
+missing = []
+for name in required:
+    try:
+        importlib.import_module(name)
+    except Exception:
+        missing.append(name)
+
+if missing:
+    print("[P2] ERROR: Missing Python packages in venv: " + ", ".join(missing), file=sys.stderr)
+    print("", file=sys.stderr)
+    print("[P2] Install them like this:", file=sys.stderr)
+    print("  source .venv/bin/activate", file=sys.stderr)
+    print("  python -m pip install -r requirements.txt", file=sys.stderr)
+    sys.exit(2)
+PY
+}
+
+
+run_plots(){
+  [[ -f "$ROOT_DIR/scripts/plot_p2.py" ]] || die "Plot script not found: $ROOT_DIR/scripts/plot_p2.py"
+
+  local plot_log="$LOG_DIR/plots.log"
+  local before after new
+
+  before="$(count_png "$PLOT_DIR")"
+
+  log "[P2] [PLOT] start p2_plots"
+  if "$PY" "$ROOT_DIR/scripts/plot_p2.py" --results "$OUTDIR" --strict-png >"$plot_log" 2>&1; then
+    after="$(count_png "$PLOT_DIR")"
+    new=$((after - before))
+    (( new < 0 )) && new=0
+    log "[P2] [PLOT] ok    p2_plots (+${new} png, total=${after})"
+  else
+    warn "[P2] [PLOT] FAILED p2_plots (see $plot_log)"
+    tail -n 80 "$plot_log" || true
+    return 1
+  fi
+}
+
+do_merges(){
+
+  local steps=(
+    "plain|$RAW_DIR/p2_summary_all.csv|*/raw/p2_summary.csv|transport,simTime,appStart,distance,pktSize,udpRate,tcpMaxBytes,seed,run,rxBytes,goodputbps"
+    "ts|$RAW_DIR/throughput_timeseries_all.csv|transport,run,time_s,throughput_bps|throughput_timeseries.csv"
+    "ts|$RAW_DIR/rtt_timeseries_all.csv|transport,run,time_s,seq,rtt_ms|rtt_timeseries.csv"
+  )
+
+  local total="${#steps[@]}"
+  local i=0
+
+  for s in "${steps[@]}"; do
+    i=$((i+1))
+    IFS='|' read -r type out a2 a3 <<< "$s"
+
+    step_log "$i" "$total" "MERGE" "start" "$(basename "$out")"
+
+    if [[ "$type" == "plain" ]]; then
+      merge_plain "$out" "$a2" "$a3"
+    elif [[ "$type" == "ts" ]]; then
+      merge_timeseries_with_keys "$out" "$a2" "$a3"
+    else
+      die "Unknown merge step type: $type"
+    fi
+
+    step_log "$i" "$total" "MERGE" "ok" "$(basename "$out")"
+  done
+}
+
 
 # ---------------------------- Main ----------------------------
 main(){
@@ -194,7 +319,7 @@ main(){
     mkdir -p "$out_run/raw" "$out_run/logs" "$out_run/plots"
 
     local args; args="$(common_args "$out_run" "$runnum" "$t")"
-    run_one "$(safe_tag "$tag")" "$args" "$idx" "$total" &
+    run_one "$(safe_tag "$tag")" "$out_run" "$args" "$idx" "$total" &
     running=$((running+1))
 
     if (( running >= JOBS )); then
@@ -206,25 +331,10 @@ main(){
     if wait -n; then running=$((running-1)); else fail=$((fail+1)); running=$((running-1)); fi
   done
 
-  # --- Consolidate outputs (no overwrite) ---
-  # Summary: concatenate all p2_summary.csv lines
-  merge_plain \
-    "$RAW_DIR/p2_summary_all.csv" \
-    "*/raw/p2_summary.csv" \
-    "transport,simTime,appStart,distance,pktSize,udpRate,tcpMaxBytes,seed,run,rxBytes,goodputbps"
+  # --- Consolidate outputs (dynamic, counted) ---
+  do_merges
 
-  # Timeseries (add transport,run columns)
-  merge_timeseries_with_keys \
-    "$RAW_DIR/throughput_timeseries_all.csv" \
-    "transport,run,time_s,throughput_bps" \
-    "throughput_timeseries.csv"
 
-  merge_timeseries_with_keys \
-    "$RAW_DIR/rtt_timeseries_all.csv" \
-    "transport,run,time_s,seq,rtt_ms" \
-    "rtt_timeseries.csv"
-
-  # Keep per-transport copies (closer to PDF expected names, but without clobbering)
   for d in "$TMP_ROOT"/p2_udp_run*; do
     [[ -d "$d" ]] || continue
     [[ -f "$d/raw/throughput_timeseries.csv" ]] && cp -f "$d/raw/throughput_timeseries.csv" "$RAW_DIR/throughput_timeseries_udp.csv" || true
@@ -238,20 +348,15 @@ main(){
     [[ -f "$d/raw/flowmon.xml" ]] && cp -f "$d/raw/flowmon.xml" "$RAW_DIR/flowmon_tcp.xml" || true
   done
 
-  # Copy all pcaps / flowmons etc per-run for debugging
-  copy_per_run "per_run_raw" "*/raw/*"
-  copy_per_run "per_run_logs" "*/logs/*"   # (in case your C++ writes logs later)
+  copy_per_run_tree
+
 
   rm -rf "$TMP_ROOT" || true
 
-  log "[P2] Completed."
-  log "[P2] Key outputs:"
-  log "     - $RAW_DIR/p2_summary_all.csv"
-  log "     - $RAW_DIR/throughput_timeseries_all.csv"
-  log "     - $RAW_DIR/rtt_timeseries_all.csv"
-  log "     - $RAW_DIR/throughput_timeseries_udp.csv / _tcp.csv"
-  log "     - $RAW_DIR/rtt_timeseries_udp.csv / _tcp.csv"
-  log "     - $RAW_DIR/flowmon_udp.xml / _tcp.xml (if enabled)"
+  # --- NEW: Generate plots (venv is created, deps must already be installed) ---
+  ensure_venv
+  check_plot_deps_or_die
+  run_plots
 
   (( fail == 0 )) || die "[P2] One or more runs failed (see $LOG_DIR)"
 }

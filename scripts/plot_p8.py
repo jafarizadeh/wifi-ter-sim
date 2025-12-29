@@ -1,430 +1,480 @@
 #!/usr/bin/env python3
-"""
-scripts/plot_p8.py
-
-Project 8 plotting script (ns-3 QoS/WMM):
-- Reads results/p8/raw/p8_summary.csv
-- Produces publication-quality plots (PNG only):
-  * Delay/Jitter vs BE rate for VO & VI (OFF vs ON)
-  * Goodput vs BE rate for VO, VI, BE (OFF vs ON)
-  * Loss vs BE rate for VO & VI (OFF vs ON) with proper y-scaling
-  * Optional bar chart for a chosen BE rate (default 40 Mbps): OFF vs ON
-
-Outputs:
-- PNG figures in results/p8/plots/
-
-Requirements:
-  pip install pandas numpy matplotlib
-"""
+# -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+import sys
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
-
-import matplotlib
-matplotlib.use("Agg")  # headless-safe
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 
-REQUIRED_COLS = [
-    "mode", "beRateMbps", "seed", "run",
-    "goodputBE", "goodputVO", "goodputVI",
-    "delayVO_ms", "jitterVO_ms", "lossVO",
-    "delayVI_ms", "jitterVI_ms", "lossVI",
-]
-
-METRICS = [
-    "goodputBE", "goodputVO", "goodputVI",
-    "delayVO_ms", "jitterVO_ms", "lossVO",
-    "delayVI_ms", "jitterVI_ms", "lossVI",
-]
-
-
-@dataclass
-class PlotCfg:
-    dpi: int = 200
-    ci: str = "95"                  # "none" | "std" | "95"
-    min_n_for_ci: int = 5           # show CI only if n >= this
-    show_raw_points: bool = True    # scatter per-run points behind means
-    raw_alpha: float = 0.25
-    grid: bool = True
-    logy_delay: bool = False
-    logy_jitter: bool = False
-    loss_scale: str = "auto"        # "auto" | "0-1" | "log"
-
-
-def repo_root_from_script() -> Path:
-    # Assumes this script is in <repo>/scripts/plot_p8.py
+# ---------------- Paths ----------------
+def repo_root() -> Path:
+    # WIFI-TER-SIM/scripts/plot_p8.py -> parents[1] is repo root
     return Path(__file__).resolve().parents[1]
 
 
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+def resolve_results_dir(user_path: str | None, project: str = "p8") -> Path:
+    root = repo_root()
+    if user_path:
+        p = Path(user_path)
+        if p.exists():
+            return p.resolve()
+        p2 = (root / user_path).resolve()
+        if p2.exists():
+            return p2
+        raise FileNotFoundError(f"--results not found: {user_path} (tried CWD and repo root).")
+    return (root / "results" / project).resolve()
 
 
-def read_and_validate(csv_path: Path) -> pd.DataFrame:
-    if not csv_path.exists():
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
-
-    df = pd.read_csv(csv_path)
-
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"CSV missing columns: {missing}\nFound columns: {list(df.columns)}"
-        )
-
-    # Normalize mode to OFF/ON
-    df["mode"] = df["mode"].astype(str).str.strip().str.upper()
-
-    # Coerce numeric columns
-    for c in [x for x in REQUIRED_COLS if x != "mode"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Drop broken rows
-    df = df.dropna(subset=["mode", "beRateMbps", "run"]).copy()
-
-    # Sort for plotting
-    df = df.sort_values(["beRateMbps", "mode", "run"]).reset_index(drop=True)
-    return df
+def ensure_dir(d: Path) -> None:
+    d.mkdir(parents=True, exist_ok=True)
 
 
-def t_critical_95(n: int) -> float:
-    """Approx t critical for 95% CI (two-sided) without scipy."""
-    if n <= 1:
-        return float("nan")
-    dof = n - 1
-    lookup = {
-        1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
-        6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
-        15: 2.131, 20: 2.086, 25: 2.060, 30: 2.042, 40: 2.021,
-        60: 2.000, 120: 1.980,
-    }
-    if dof in lookup:
-        return lookup[dof]
-    keys = sorted(lookup.keys())
-    if dof < keys[0]:
-        return lookup[keys[0]]
-    if dof > keys[-1]:
-        return 1.96
-    lo = max(k for k in keys if k < dof)
-    hi = min(k for k in keys if k > dof)
-    w = (dof - lo) / (hi - lo)
-    return lookup[lo] * (1 - w) + lookup[hi] * w
+# ---------------- Robust I/O ----------------
+def read_csv_robust(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing/empty CSV: {path}")
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        # fallback
+        return pd.read_csv(path, engine="python")
 
 
-def aggregate(df: pd.DataFrame) -> pd.DataFrame:
-    g = df.groupby(["mode", "beRateMbps"], as_index=False)
-    agg = g[METRICS].agg(["mean", "std", "count"])
-    agg.columns = ["_".join([c for c in col if c]) for col in agg.columns.to_flat_index()]
-    agg = agg.rename(columns={"mode_": "mode", "beRateMbps_": "beRateMbps"})
-
-    # CI95 half-width
-    for m in METRICS:
-        n = agg[f"{m}_count"].astype(int).to_numpy()
-        std = agg[f"{m}_std"].astype(float).to_numpy()
-        sem = std / np.sqrt(np.maximum(n, 1))
-        tvals = np.array([t_critical_95(int(x)) for x in n], dtype=float)
-        agg[f"{m}_ci95"] = tvals * sem
-
-    return agg.sort_values(["beRateMbps", "mode"]).reset_index(drop=True)
+def pick_col(df: pd.DataFrame, candidates: Iterable[str], required: bool = True) -> str | None:
+    cols = set(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    if required:
+        raise ValueError(f"Missing required column. Tried: {list(candidates)}. Existing: {list(df.columns)}")
+    return None
 
 
-def _yerr(sub: pd.DataFrame, metric: str, cfg: PlotCfg) -> np.ndarray:
-    n = sub[f"{metric}_count"].to_numpy(dtype=float)
-
-    if cfg.ci == "none":
-        return np.zeros(len(sub), dtype=float)
-
-    if cfg.ci == "std":
-        y = sub[f"{metric}_std"].to_numpy(dtype=float)
-        y = np.nan_to_num(y, nan=0.0)
-        return np.where(n >= 2, y, 0.0)
-
-    # cfg.ci == "95"
-    y = sub[f"{metric}_ci95"].to_numpy(dtype=float)
-    y = np.nan_to_num(y, nan=0.0)
-    return np.where(n >= cfg.min_n_for_ci, y, 0.0)
+def to_num(df: pd.DataFrame, cols: Iterable[str]) -> None:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
 
-def line_plot(
-    df_raw: pd.DataFrame,
-    agg: pd.DataFrame,
-    metric: str,
-    ylabel: str,
+def normalize_mode(x: str) -> str:
+    s = str(x).strip().upper()
+    if s in ("0", "OFF", "FALSE", "NO"):
+        return "OFF"
+    if s in ("1", "ON", "TRUE", "YES"):
+        return "ON"
+    return s
+
+
+def mean_std(x: pd.Series) -> tuple[float, float, int]:
+    v = pd.to_numeric(x, errors="coerce").dropna().astype(float)
+    n = int(len(v))
+    if n == 0:
+        return np.nan, np.nan, 0
+    if n == 1:
+        return float(v.iloc[0]), 0.0, 1
+    return float(v.mean()), float(v.std(ddof=1)), n
+
+
+def jain_index(vals: np.ndarray) -> float:
+    v = np.asarray(vals, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return np.nan
+    s = float(v.sum())
+    ss = float((v * v).sum())
+    if ss <= 0:
+        return np.nan
+    return (s * s) / (v.size * ss)
+
+
+def maybe_bps_to_mbps(series: pd.Series, name_hint: str = "") -> pd.Series:
+    """
+    Convert to Mbps if likely in bps.
+    Heuristics:
+      - if column name contains 'bps' or endswith '_bps' => divide by 1e6
+      - else if median is huge (>1e4) we assume bps (keeps compatibility with older outputs)
+    """
+    v = pd.to_numeric(series, errors="coerce")
+    nh = name_hint.lower()
+    if "bps" in nh or nh.endswith("_bps"):
+        return v / 1e6
+
+    arr = v.to_numpy(dtype=float, copy=False)
+    med = np.nanmedian(arr) if np.isfinite(arr).any() else np.nan
+    if np.isfinite(med) and med > 1e4:
+        return v / 1e6
+    return v
+
+
+# ---------------- Plot saving (safe PNG) ----------------
+def save_fig_safe(fig: go.Figure, out_dir: Path, stem: str, strict_png: bool) -> None:
+    html = out_dir / f"{stem}.html"
+    png = out_dir / f"{stem}.png"
+
+    fig.write_html(str(html), include_plotlyjs="cdn")
+
+    # PNG via kaleido
+    try:
+        fig.write_image(str(png), scale=2)  # kaleido
+    except Exception as e:
+        if strict_png:
+            raise RuntimeError(f"Failed to write PNG for {stem}: {e}") from e
+        # else: keep html only
+
+
+# ---------------- Plot builders ----------------
+def grouped_bar_off_on(
+    x_labels: list[str],
+    off_mean: list[float],
+    on_mean: list[float],
+    off_std: list[float] | None,
+    on_std: list[float] | None,
     title: str,
-    cfg: PlotCfg,
-    ylog: bool = False,
-    loss_plot: bool = False,
-) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    y_title: str,
+) -> go.Figure:
+    fig = go.Figure()
 
-    mode_order = ["OFF", "ON"] if set(["OFF", "ON"]).issubset(set(agg["mode"])) else sorted(agg["mode"].unique())
+    fig.add_trace(go.Bar(
+        x=x_labels,
+        y=off_mean,
+        name="OFF",
+        error_y=dict(type="data", array=(off_std or [0.0] * len(off_mean))),
+        hovertemplate="%{x}<br>OFF=%{y:.3f}<extra></extra>",
+    ))
 
-    style = {
-        "OFF": dict(marker="o", linestyle="-", linewidth=2.0),
-        "ON":  dict(marker="s", linestyle="--", linewidth=2.0),
-    }
+    fig.add_trace(go.Bar(
+        x=x_labels,
+        y=on_mean,
+        name="ON",
+        error_y=dict(type="data", array=(on_std or [0.0] * len(on_mean))),
+        hovertemplate="%{x}<br>ON=%{y:.3f}<extra></extra>",
+    ))
 
-    x_ticks = sorted(agg["beRateMbps"].unique().tolist())
-
-    for mode in mode_order:
-        sub = agg[agg["mode"] == mode].sort_values("beRateMbps")
-        if sub.empty:
-            continue
-
-        x = sub["beRateMbps"].to_numpy(dtype=float)
-        y = sub[f"{metric}_mean"].to_numpy(dtype=float)
-        yerr = _yerr(sub, metric, cfg)
-
-        # raw points
-        if cfg.show_raw_points:
-            raw_sub = df_raw[df_raw["mode"] == mode]
-            ax.scatter(
-                raw_sub["beRateMbps"].to_numpy(dtype=float),
-                raw_sub[metric].to_numpy(dtype=float),
-                s=18,
-                alpha=cfg.raw_alpha,
-                zorder=1,
-            )
-
-        st = style.get(mode, dict(marker="o", linestyle="-", linewidth=2.0))
-        ax.errorbar(
-            x, y, yerr=yerr,
-            capsize=3,
-            label=mode,
-            zorder=3,
-            **st
-        )
-
-    ax.set_xlabel("BE offered rate (Mbps)")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.set_xticks(x_ticks)
-
-    if cfg.grid:
-        ax.grid(True, which="both", linestyle="--", linewidth=0.8, alpha=0.6)
-
-    ax.legend(loc="best")
-
-    if loss_plot:
-        if cfg.loss_scale == "0-1":
-            ax.set_ylim(0.0, 1.0)
-        elif cfg.loss_scale == "log":
-            ax.set_yscale("log")
-            ax.set_ylim(1e-6, 1.0)
-        else:
-            y_all = agg[f"{metric}_mean"].to_numpy(dtype=float)
-            e_all = agg[f"{metric}_ci95"].to_numpy(dtype=float)
-            ymax = float(np.nanmax(y_all + np.nan_to_num(e_all, nan=0.0)))
-            if not np.isfinite(ymax) or ymax <= 0.0:
-                ymax = 1e-4
-            ax.set_ylim(0.0, max(1.2 * ymax, 1e-4))
-
-            if np.nanmax(np.abs(y_all)) == 0.0:
-                ax.text(
-                    0.5, 0.5, "All loss values are 0 in this dataset",
-                    transform=ax.transAxes,
-                    ha="center", va="center",
-                    fontsize=10,
-                    bbox=dict(boxstyle="round,pad=0.3", alpha=0.2),
-                )
-
-    if ylog:
-        ax.set_yscale("log")
-
-    fig.tight_layout()
+    fig.update_layout(
+        title=title,
+        xaxis_title="Class",
+        yaxis_title=y_title,
+        barmode="group",
+        template="plotly_white",
+    )
     return fig
 
 
-def bar_compare_at_rate(
+def line_vs_rate(
     agg: pd.DataFrame,
-    be_rate: float,
-    metrics: List[Tuple[str, str]],
-    cfg: PlotCfg,
-) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(10.5, 4.2))
-
-    sub = agg[np.isclose(agg["beRateMbps"].astype(float), float(be_rate))].copy()
-    if sub.empty:
-        ax.text(0.5, 0.5, f"No data for BE rate={be_rate}", ha="center", va="center")
-        ax.axis("off")
-        fig.tight_layout()
-        return fig
-
-    mode_order = ["OFF", "ON"]
-    sub["mode"] = sub["mode"].astype(str)
-    sub = sub.set_index("mode").reindex(mode_order)
-
-    labels = [lbl for _, lbl in metrics]
-    x = np.arange(len(metrics))
-    width = 0.38
-
-    for i, mode in enumerate(mode_order):
-        if mode not in sub.index or sub.loc[mode].isna().all():
-            continue
-
-        means = np.array([sub.loc[mode, f"{m}_mean"] for m, _ in metrics], dtype=float)
-
-        yerr = []
-        for m, _ in metrics:
-            n = int(sub.loc[mode, f"{m}_count"]) if np.isfinite(sub.loc[mode, f"{m}_count"]) else 0
-            if cfg.ci == "95" and n >= cfg.min_n_for_ci:
-                yerr.append(float(sub.loc[mode, f"{m}_ci95"]))
-            elif cfg.ci == "std" and n >= 2:
-                yerr.append(float(sub.loc[mode, f"{m}_std"]))
-            else:
-                yerr.append(0.0)
-        yerr = np.array(yerr, dtype=float)
-
-        offset = (i - 0.5) * width
-        ax.bar(x + offset, means, width, yerr=yerr, capsize=3, label=mode)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_title(f"OFF vs ON at BE rate = {be_rate} Mbps")
-    if cfg.grid:
-        ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.6)
-    ax.legend(loc="best")
-    fig.tight_layout()
+    x_col: str,
+    y_col: str,
+    y_err: str,
+    title: str,
+    y_title: str,
+) -> go.Figure:
+    fig = go.Figure()
+    for mode, g in agg.groupby("mode"):
+        g = g.sort_values(x_col)
+        fig.add_trace(go.Scatter(
+            x=g[x_col],
+            y=g[y_col],
+            mode="lines+markers",
+            name=str(mode),
+            error_y=dict(type="data", array=g[y_err].fillna(0.0)),
+            hovertemplate="rate=%{x}<br>value=%{y:.3f}<extra></extra>",
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="BE rate (Mbps)",
+        yaxis_title=y_title,
+        template="plotly_white",
+        hovermode="x unified",
+        legend_title="Mode",
+    )
     return fig
 
 
-def save_png(fig: plt.Figure, png_path: Path, cfg: PlotCfg) -> None:
-    fig.savefig(png_path, dpi=cfg.dpi)
-    plt.close(fig)
+# ---------------- Main ----------------
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Plot Project 8 (QoS/WMM) results.")
+    ap.add_argument("--results", type=str, default=None, help="Path to results/p8 (default: <repo>/results/p8)")
+    ap.add_argument("--strict-png", action="store_true", help="Fail if PNG export fails (requires kaleido).")
+    args = ap.parse_args()
 
+    res_dir = resolve_results_dir(args.results, "p8")
+    raw_dir = res_dir / "raw"
+    plot_dir = res_dir / "plots"
+    ensure_dir(plot_dir)
 
-def main() -> None:
-    root = repo_root_from_script()
+    csv_path = raw_dir / "p8_summary.csv"
+    if not csv_path.exists():
+        alt = raw_dir / "p8_summary_all.csv"
+        if alt.exists():
+            csv_path = alt
+        else:
+            print(f"[ERROR] Missing: {raw_dir/'p8_summary.csv'} (or p8_summary_all.csv)", file=sys.stderr)
+            print("Run: ./scripts/run_p8.sh", file=sys.stderr)
+            return 2
 
-    p = argparse.ArgumentParser(description="Plot Project 8 (QoS/WMM) results from p8_summary.csv")
-    p.add_argument("--csv", type=str, default=str(root / "results" / "p8" / "raw" / "p8_summary.csv"),
-                   help="Path to p8_summary.csv")
-    p.add_argument("--outdir", type=str, default=str(root / "results" / "p8"),
-                   help="Project output dir (contains raw/, logs/, plots/...)")
-    p.add_argument("--dpi", type=int, default=200, help="PNG DPI")
-    p.add_argument("--ci", type=str, default="95", choices=["none", "std", "95"],
-                   help="Error bars: none | std | 95 (95% CI)")
-    p.add_argument("--min-n-ci", type=int, default=5,
-                   help="Show 95% CI only if count >= this (default: 5)")
-    p.add_argument("--no-raw", action="store_true", help="Disable raw per-run scatter points")
-    p.add_argument("--logy-delay", action="store_true", help="Log scale for delay plots")
-    p.add_argument("--logy-jitter", action="store_true", help="Log scale for jitter plots")
-    p.add_argument("--loss-scale", type=str, default="auto", choices=["auto", "0-1", "log"],
-                   help="Loss y-axis scaling: auto (zoom), 0-1, or log")
-    p.add_argument("--bar-be-rate", type=float, default=40.0,
-                   help="BE rate for OFF/ON bar comparison plot")
-    args = p.parse_args()
+    df = read_csv_robust(csv_path)
 
-    outdir = Path(args.outdir).resolve()
-    csv_path = Path(args.csv).resolve()
-    plots_dir = outdir / "plots"
-    ensure_dir(plots_dir)
+    # --- pick/normalize columns robustly ---
+    mode_col = pick_col(df, ["mode", "qosMode", "wmm", "WMM", "qos"])
+    be_rate_col = pick_col(df, ["beRateMbps", "beRate", "be_rate_mbps", "be_rate"], required=False)
 
-    cfg = PlotCfg(
-        dpi=int(args.dpi),
-        ci=str(args.ci),
-        min_n_for_ci=int(args.min_n_ci),
-        show_raw_points=(not args.no_raw),
-        logy_delay=bool(args.logy_delay),
-        logy_jitter=bool(args.logy_jitter),
-        loss_scale=str(args.loss_scale),
+    goodput_be_col = pick_col(df, ["goodputBE", "goodputBE_bps", "goodputBEbps", "goodputBE_Mbps", "goodputBe"])
+    goodput_vo_col = pick_col(df, ["goodputVO", "goodputVO_bps", "goodputVObps", "goodputVO_Mbps", "goodputVo"])
+    goodput_vi_col = pick_col(df, ["goodputVI", "goodputVI_bps", "goodputVIbps", "goodputVI_Mbps", "goodputVi"])
+
+    delay_vo_col = pick_col(df, ["delayVO_ms", "delayVOms", "delayVO", "voDelay_ms", "voDelayMs"])
+    jitter_vo_col = pick_col(df, ["jitterVO_ms", "jitterVOms", "jitterVO", "voJitter_ms", "voJitterMs"])
+    loss_vo_col = pick_col(df, ["lossVO", "lossVO_ratio", "lossVO_pct", "voLoss", "voLossRatio"], required=False)
+
+    delay_vi_col = pick_col(df, ["delayVI_ms", "delayVIms", "delayVI", "viDelay_ms", "viDelayMs"])
+    jitter_vi_col = pick_col(df, ["jitterVI_ms", "jitterVIms", "jitterVI", "viJitter_ms", "viJitterMs"])
+    loss_vi_col = pick_col(df, ["lossVI", "lossVI_ratio", "lossVI_pct", "viLoss", "viLossRatio"], required=False)
+
+    # numeric conversions
+    df[mode_col] = df[mode_col].apply(normalize_mode)
+    to_num(df, [be_rate_col] if be_rate_col else [])
+    to_num(df, [goodput_be_col, goodput_vo_col, goodput_vi_col,
+                delay_vo_col, jitter_vo_col, delay_vi_col, jitter_vi_col])
+    if loss_vo_col:
+        to_num(df, [loss_vo_col])
+    if loss_vi_col:
+        to_num(df, [loss_vi_col])
+
+    # derived Mbps goodputs (robust to bps)
+    df["goodputBE_Mbps"] = maybe_bps_to_mbps(df[goodput_be_col], goodput_be_col)
+    df["goodputVO_Mbps"] = maybe_bps_to_mbps(df[goodput_vo_col], goodput_vo_col)
+    df["goodputVI_Mbps"] = maybe_bps_to_mbps(df[goodput_vi_col], goodput_vi_col)
+
+    # Ensure both OFF/ON appear (still plot if one missing)
+    modes_present = sorted(set(df[mode_col].dropna().unique().tolist()))
+    if not modes_present:
+        print("[ERROR] No valid mode values found.", file=sys.stderr)
+        return 3
+
+    def mode_stats(series: pd.Series) -> dict[str, tuple[float, float]]:
+        out = {}
+        for m, g in df.groupby(mode_col):
+            mu, sd, _ = mean_std(g[series.name])
+            out[str(m)] = (mu, sd)
+        return out
+
+    # ---------------- Mandatory: Delay (VO/VI) OFF vs ON ----------------
+    rows = []
+    for m, g in df.groupby(mode_col):
+        m_vo, s_vo, _ = mean_std(g[delay_vo_col])
+        m_vi, s_vi, _ = mean_std(g[delay_vi_col])
+        rows.append({"mode": str(m), "VO_mean": m_vo, "VO_std": s_vo, "VI_mean": m_vi, "VI_std": s_vi})
+    a = pd.DataFrame(rows).set_index("mode")
+
+    def get_or_nan(ix: str, col: str) -> float:
+        return float(a.loc[ix, col]) if ix in a.index else float("nan")
+
+    fig = grouped_bar_off_on(
+        x_labels=["VO", "VI"],
+        off_mean=[get_or_nan("OFF", "VO_mean"), get_or_nan("OFF", "VI_mean")],
+        on_mean=[get_or_nan("ON", "VO_mean"), get_or_nan("ON", "VI_mean")],
+        off_std=[get_or_nan("OFF", "VO_std"), get_or_nan("OFF", "VI_std")] if "OFF" in a.index else None,
+        on_std=[get_or_nan("ON", "VO_std"), get_or_nan("ON", "VI_std")] if "ON" in a.index else None,
+        title="P8 - Delay (VO/VI): QoS OFF vs ON",
+        y_title="Mean delay (ms)",
     )
+    save_fig_safe(fig, plot_dir, "mandatory_delay_vo_vi_off_on", strict_png=args.strict_png)
 
-    # nicer defaults
-    plt.rcParams.update({
-        "figure.facecolor": "white",
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "axes.titleweight": "bold",
-        "axes.labelsize": 12,
-        "axes.titlesize": 14,
-        "legend.frameon": True,
-        "legend.framealpha": 0.9,
-        "font.size": 11,
-    })
+    # ---------------- Mandatory: Jitter (VO/VI) OFF vs ON ----------------
+    rows = []
+    for m, g in df.groupby(mode_col):
+        m_vo, s_vo, _ = mean_std(g[jitter_vo_col])
+        m_vi, s_vi, _ = mean_std(g[jitter_vi_col])
+        rows.append({"mode": str(m), "VO_mean": m_vo, "VO_std": s_vo, "VI_mean": m_vi, "VI_std": s_vi})
+    a = pd.DataFrame(rows).set_index("mode")
 
-    df = read_and_validate(csv_path)
-    agg = aggregate(df)
+    fig = grouped_bar_off_on(
+        x_labels=["VO", "VI"],
+        off_mean=[get_or_nan("OFF", "VO_mean"), get_or_nan("OFF", "VI_mean")],
+        on_mean=[get_or_nan("ON", "VO_mean"), get_or_nan("ON", "VI_mean")],
+        off_std=[get_or_nan("OFF", "VO_std"), get_or_nan("OFF", "VI_std")] if "OFF" in a.index else None,
+        on_std=[get_or_nan("ON", "VO_std"), get_or_nan("ON", "VI_std")] if "ON" in a.index else None,
+        title="P8 - Jitter (VO/VI): QoS OFF vs ON",
+        y_title="Mean jitter (ms)",
+    )
+    save_fig_safe(fig, plot_dir, "mandatory_jitter_vo_vi_off_on", strict_png=args.strict_png)
 
-    # Print aggregated stats to console (NO CSV written)
-    print("\n=== Aggregated stats (mode, beRateMbps) ===")
-    cols_to_show = [
-        "mode", "beRateMbps",
-        "goodputBE_mean", "goodputVO_mean", "goodputVI_mean",
-        "delayVO_ms_mean", "jitterVO_ms_mean", "lossVO_mean",
-        "delayVI_ms_mean", "jitterVI_ms_mean", "lossVI_mean",
-    ]
-    existing = [c for c in cols_to_show if c in agg.columns]
-    print(agg[existing].to_string(index=False))
+    # ---------------- Mandatory: BE goodput OFF vs ON ----------------
+    rows = []
+    for m, g in df.groupby(mode_col):
+        mu, sd, _ = mean_std(g["goodputBE_Mbps"])
+        rows.append({"mode": str(m), "mean": mu, "std": sd})
+    a = pd.DataFrame(rows).set_index("mode")
 
-    # ---- Save PNGs only ----
-    save_png(
-        line_plot(df, agg, "delayVO_ms", "Mean delay VO (ms)", "VO delay vs BE rate",
-                  cfg, ylog=cfg.logy_delay),
-        plots_dir / "p8_vo_delay.png", cfg
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=["BE"], y=[get_or_nan("OFF", "mean")],
+        name="OFF",
+        error_y=dict(type="data", array=[get_or_nan("OFF", "std")] if "OFF" in a.index else [0.0]),
+        hovertemplate="BE<br>OFF=%{y:.3f} Mbps<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=["BE"], y=[get_or_nan("ON", "mean")],
+        name="ON",
+        error_y=dict(type="data", array=[get_or_nan("ON", "std")] if "ON" in a.index else [0.0]),
+        hovertemplate="BE<br>ON=%{y:.3f} Mbps<extra></extra>",
+    ))
+    fig.update_layout(
+        title="P8 - Best Effort goodput: QoS OFF vs ON",
+        xaxis_title="Traffic class",
+        yaxis_title="Goodput (Mbps)",
+        barmode="group",
+        template="plotly_white",
     )
-    save_png(
-        line_plot(df, agg, "jitterVO_ms", "Mean jitter VO (ms)", "VO jitter vs BE rate",
-                  cfg, ylog=cfg.logy_jitter),
-        plots_dir / "p8_vo_jitter.png", cfg
-    )
-    save_png(
-        line_plot(df, agg, "delayVI_ms", "Mean delay VI (ms)", "VI delay vs BE rate",
-                  cfg, ylog=cfg.logy_delay),
-        plots_dir / "p8_vi_delay.png", cfg
-    )
-    save_png(
-        line_plot(df, agg, "jitterVI_ms", "Mean jitter VI (ms)", "VI jitter vs BE rate",
-                  cfg, ylog=cfg.logy_jitter),
-        plots_dir / "p8_vi_jitter.png", cfg
-    )
+    save_fig_safe(fig, plot_dir, "mandatory_goodput_be_off_on", strict_png=args.strict_png)
 
-    save_png(
-        line_plot(df, agg, "goodputVO", "Goodput VO (Mbps)", "VO goodput vs BE rate", cfg),
-        plots_dir / "p8_vo_goodput.png", cfg
-    )
-    save_png(
-        line_plot(df, agg, "goodputVI", "Goodput VI (Mbps)", "VI goodput vs BE rate", cfg),
-        plots_dir / "p8_vi_goodput.png", cfg
-    )
-    save_png(
-        line_plot(df, agg, "goodputBE", "Goodput BE (Mbps)", "BE goodput vs BE rate", cfg),
-        plots_dir / "p8_be_goodput.png", cfg
-    )
+    # ---------------- Recommended: Loss (VO/VI) OFF vs ON ----------------
+    if loss_vo_col and loss_vi_col:
+        rows = []
+        for m, g in df.groupby(mode_col):
+            m_vo, s_vo, _ = mean_std(g[loss_vo_col])
+            m_vi, s_vi, _ = mean_std(g[loss_vi_col])
+            rows.append({"mode": str(m), "VO_mean": m_vo, "VO_std": s_vo, "VI_mean": m_vi, "VI_std": s_vi})
+        a = pd.DataFrame(rows).set_index("mode")
 
-    save_png(
-        line_plot(df, agg, "lossVO", "Loss ratio VO", "VO loss vs BE rate",
-                  cfg, loss_plot=True),
-        plots_dir / "p8_vo_loss.png", cfg
-    )
-    save_png(
-        line_plot(df, agg, "lossVI", "Loss ratio VI", "VI loss vs BE rate",
-                  cfg, loss_plot=True),
-        plots_dir / "p8_vi_loss.png", cfg
-    )
+        fig = grouped_bar_off_on(
+            x_labels=["VO", "VI"],
+            off_mean=[get_or_nan("OFF", "VO_mean"), get_or_nan("OFF", "VI_mean")],
+            on_mean=[get_or_nan("ON", "VO_mean"), get_or_nan("ON", "VI_mean")],
+            off_std=[get_or_nan("OFF", "VO_std"), get_or_nan("OFF", "VI_std")] if "OFF" in a.index else None,
+            on_std=[get_or_nan("ON", "VO_std"), get_or_nan("ON", "VI_std")] if "ON" in a.index else None,
+            title="P8 (Recommended) - Loss (VO/VI): QoS OFF vs ON",
+            y_title="Loss (as exported)",
+        )
+        save_fig_safe(fig, plot_dir, "rec_loss_vo_vi_off_on", strict_png=args.strict_png)
 
-    bar_metrics = [
-        ("delayVO_ms", "VO delay (ms)"),
-        ("jitterVO_ms", "VO jitter (ms)"),
-        ("delayVI_ms", "VI delay (ms)"),
-        ("jitterVI_ms", "VI jitter (ms)"),
-    ]
-    save_png(
-        bar_compare_at_rate(agg, args.bar_be_rate, bar_metrics, cfg),
-        plots_dir / "p8_bar_off_on.png", cfg
-    )
+    # ---------------- Recommended: Goodput per class (BE/VO/VI) OFF vs ON ----------------
+    rows = []
+    for m, g in df.groupby(mode_col):
+        mbe, sbe, _ = mean_std(g["goodputBE_Mbps"])
+        mvo, svo, _ = mean_std(g["goodputVO_Mbps"])
+        mvi, svi, _ = mean_std(g["goodputVI_Mbps"])
+        rows.append({"mode": str(m),
+                     "BE_mean": mbe, "BE_std": sbe,
+                     "VO_mean": mvo, "VO_std": svo,
+                     "VI_mean": mvi, "VI_std": svi})
+    a = pd.DataFrame(rows).set_index("mode")
 
-    print("\n P8 PNG plots generated:")
-    print(f"  - {plots_dir}")
+    fig = grouped_bar_off_on(
+        x_labels=["BE", "VO", "VI"],
+        off_mean=[get_or_nan("OFF", "BE_mean"), get_or_nan("OFF", "VO_mean"), get_or_nan("OFF", "VI_mean")],
+        on_mean=[get_or_nan("ON", "BE_mean"), get_or_nan("ON", "VO_mean"), get_or_nan("ON", "VI_mean")],
+        off_std=[get_or_nan("OFF", "BE_std"), get_or_nan("OFF", "VO_std"), get_or_nan("OFF", "VI_std")] if "OFF" in a.index else None,
+        on_std=[get_or_nan("ON", "BE_std"), get_or_nan("ON", "VO_std"), get_or_nan("ON", "VI_std")] if "ON" in a.index else None,
+        title="P8 (Recommended) - Goodput per class: QoS OFF vs ON",
+        y_title="Goodput (Mbps)",
+    )
+    save_fig_safe(fig, plot_dir, "rec_goodput_all_classes_off_on", strict_png=args.strict_png)
+
+    # ---------------- Recommended: Jain fairness across classes ----------------
+    df["jain_classes"] = df.apply(
+        lambda r: jain_index([r["goodputBE_Mbps"], r["goodputVO_Mbps"], r["goodputVI_Mbps"]]),
+        axis=1
+    )
+    rows = []
+    for m, g in df.groupby(mode_col):
+        mu, sd, _ = mean_std(g["jain_classes"])
+        rows.append({"mode": str(m), "mean": mu, "std": sd})
+    a = pd.DataFrame(rows).set_index("mode")
+
+    fig = go.Figure()
+    for m in ["OFF", "ON"]:
+        if m in a.index:
+            fig.add_trace(go.Bar(
+                x=[m],
+                y=[a.loc[m, "mean"]],
+                error_y=dict(type="data", array=[a.loc[m, "std"]]),
+                name=m,
+                hovertemplate="mode=%{x}<br>Jain=%{y:.4f}<extra></extra>",
+            ))
+    fig.update_layout(
+        title="P8 (Recommended) - Jain fairness across classes (BE/VO/VI)",
+        xaxis_title="QoS mode",
+        yaxis_title="Jain index (0..1)",
+        template="plotly_white",
+        yaxis=dict(range=[0, 1.05]),
+    )
+    save_fig_safe(fig, plot_dir, "rec_jain_fairness_across_classes", strict_png=args.strict_png)
+
+    # ---------------- Recommended: Trends vs BE rate (if beRate exists) ----------------
+    if be_rate_col:
+        tmp = df.dropna(subset=[be_rate_col, mode_col]).copy()
+        tmp["beRateMbps"] = pd.to_numeric(tmp[be_rate_col], errors="coerce")
+        tmp = tmp.dropna(subset=["beRateMbps"])
+
+        def agg_vs_rate(series: str) -> pd.DataFrame:
+            rows2 = []
+            for (mode, rate), g in tmp.groupby([mode_col, "beRateMbps"]):
+                mu, sd, _ = mean_std(g[series])
+                rows2.append({"mode": str(mode), "beRateMbps": float(rate), "mean": mu, "std": sd})
+            return pd.DataFrame(rows2)
+
+        # VO delay vs rate
+        agg = agg_vs_rate(delay_vo_col)
+        if not agg.empty:
+            fig = line_vs_rate(
+                agg=agg,
+                x_col="beRateMbps",
+                y_col="mean",
+                y_err="std",
+                title="P8 (Recommended) - VO delay vs BE rate (OFF vs ON)",
+                y_title="VO mean delay (ms)",
+            )
+            save_fig_safe(fig, plot_dir, "rec_vo_delay_vs_be_rate", strict_png=args.strict_png)
+
+        # VI delay vs rate
+        agg = agg_vs_rate(delay_vi_col)
+        if not agg.empty:
+            fig = line_vs_rate(
+                agg=agg,
+                x_col="beRateMbps",
+                y_col="mean",
+                y_err="std",
+                title="P8 (Recommended) - VI delay vs BE rate (OFF vs ON)",
+                y_title="VI mean delay (ms)",
+            )
+            save_fig_safe(fig, plot_dir, "rec_vi_delay_vs_be_rate", strict_png=args.strict_png)
+
+        # BE goodput vs rate
+        agg = agg_vs_rate("goodputBE_Mbps")
+        if not agg.empty:
+            fig = line_vs_rate(
+                agg=agg,
+                x_col="beRateMbps",
+                y_col="mean",
+                y_err="std",
+                title="P8 (Recommended) - BE goodput vs BE rate (OFF vs ON)",
+                y_title="BE goodput (Mbps)",
+            )
+            save_fig_safe(fig, plot_dir, "rec_be_goodput_vs_be_rate", strict_png=args.strict_png)
+
+    print("[OK] P8 plots saved to:", plot_dir)
+    print("Mandatory:")
+    print(" - mandatory_delay_vo_vi_off_on.(html/png)")
+    print(" - mandatory_jitter_vo_vi_off_on.(html/png)")
+    print(" - mandatory_goodput_be_off_on.(html/png)")
+    print("Recommended:")
+    print(" - rec_loss_vo_vi_off_on.(html/png) [if loss columns exist]")
+    print(" - rec_goodput_all_classes_off_on.(html/png)")
+    print(" - rec_jain_fairness_across_classes.(html/png)")
+    if be_rate_col:
+        print(" - rec_vo_delay_vs_be_rate.(html/png)")
+        print(" - rec_vi_delay_vs_be_rate.(html/png)")
+        print(" - rec_be_goodput_vs_be_rate.(html/png)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
